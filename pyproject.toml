@@ -1,0 +1,30 @@
+[project]
+name = "egx-mcp-server"
+version = "0.1.0"
+description = "MCP server for Egyptian Exchange index data"
+readme = "README.md"
+authors = [
+    { name = "Pierre", email = "pieer44@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "egx>=0.3.0",
+    "mcp>=1.26,<2",
+    "pandas>=3.0.6",
+    "requests>=2.31",
+]
+
+[project.scripts]
+egx-mcp-server = "egx_mcp.server:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "egx_mcp"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

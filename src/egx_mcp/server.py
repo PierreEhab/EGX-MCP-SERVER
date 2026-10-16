@@ -1,0 +1,433 @@
+"""FastMCP server exposing Egyptian Exchange index data and analytics."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+from typing import Any, Literal, Sequence
+
+import pandas as pd
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
+
+from . import analytics, egx_client
+from .constants import INDEX_DESCRIPTIONS
+
+SOURCE = egx_client.SOURCE
+
+
+def _transport_security(host: str) -> TransportSecuritySettings | None:
+    configured_hosts = os.getenv("MCP_ALLOWED_HOSTS")
+    if configured_hosts is not None:
+        allowed_hosts = [
+            entry.strip() for entry in configured_hosts.split(",") if entry.strip()
+        ]
+        if not allowed_hosts:
+            raise ValueError("MCP_ALLOWED_HOSTS must contain at least one host.")
+        allowed_origins: list[str] = []
+        for allowed_host in allowed_hosts:
+            exact_host = (
+                allowed_host[:-2]
+                if allowed_host.endswith(":*")
+                else allowed_host
+            )
+            for scheme in ("http", "https"):
+                allowed_origins.append(f"{scheme}://{exact_host}")
+                if allowed_host.endswith(":*"):
+                    allowed_origins.append(f"{scheme}://{allowed_host}")
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts
+            + [
+                entry[:-2]
+                for entry in allowed_hosts
+                if entry.endswith(":*")
+            ],
+            allowed_origins=allowed_origins,
+        )
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return None
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            f"{host}:*",
+            "localhost:*",
+            "localhost",
+            "127.0.0.1:*",
+            "127.0.0.1",
+            "[::1]:*",
+            "[::1]",
+        ],
+        allowed_origins=[
+            "http://localhost:*",
+            "http://localhost",
+            "https://localhost:*",
+            "https://localhost",
+            "http://127.0.0.1:*",
+            "http://127.0.0.1",
+            "https://127.0.0.1:*",
+            "https://127.0.0.1",
+            "http://[::1]:*",
+            "http://[::1]",
+            "https://[::1]:*",
+            "https://[::1]",
+        ],
+    )
+
+
+def _new_mcp(host: str, port: int) -> FastMCP:
+    return FastMCP(
+        "egx-mcp-server",
+        instructions=(
+            "Retrieve historical Egyptian Exchange index values and calculate "
+            "index performance analytics. Data is index-only."
+        ),
+        host=host,
+        port=port,
+        transport_security=_transport_security(host),
+    )
+
+mcp = _new_mcp(
+    os.getenv("MCP_HOST", "127.0.0.1"),
+    8000,
+)
+
+
+def _error(
+    error_code: str,
+    message: str,
+    index: str | list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "index": index,
+        "as_of": None,
+        "source": SOURCE,
+        "error": {"code": error_code, "message": message},
+    }
+
+
+def _return_error(
+    error_code: str,
+    message: str,
+    index: str | list[str] | None = None,
+) -> dict[str, Any]:
+    if os.getenv("EGX_RAISE_TOOL_ERRORS", "").casefold() == "true":
+        raise ToolError(message)
+    return _error(error_code, message, index)
+
+
+def _error_for(
+    exc: egx_client.EGXClientError,
+    index: str | list[str] | None,
+) -> dict[str, Any]:
+    if isinstance(exc, egx_client.InvalidIndexError):
+        code = "INVALID_INDEX"
+    elif isinstance(exc, egx_client.EmptyDataError):
+        code = "EMPTY_DATA"
+    elif isinstance(exc, egx_client.EGXNetworkError):
+        code = "NETWORK_ERROR"
+    elif isinstance(exc, egx_client.InvalidPeriodError):
+        code = "INVALID_PERIOD"
+    else:
+        code = "DATA_SOURCE_ERROR"
+    return _return_error(code, str(exc), index)
+
+
+def _load_sync(index: str, period_days: int) -> tuple[str, int, pd.DataFrame]:
+    canonical = egx_client.resolve_index(index)
+    period = egx_client.clamp_period_days(period_days)
+    frame = egx_client.fetch_index_data(canonical, period)
+    return canonical, period, frame
+
+
+async def _load(
+    index: str,
+    period_days: int,
+) -> tuple[str, int, pd.DataFrame] | dict[str, Any]:
+    """Resolve and load an index off the event loop, returning safe tool errors."""
+    try:
+        return await asyncio.to_thread(_load_sync, index, period_days)
+    except egx_client.EGXClientError as exc:
+        return _error_for(exc, index)
+
+
+def _sample_history(
+    frame: pd.DataFrame,
+    frequency: Literal["daily", "weekly", "monthly"],
+    max_rows: int | None,
+) -> pd.DataFrame:
+    if max_rows is not None and (
+        isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1
+    ):
+        raise ValueError("max_rows must be a positive integer or None.")
+    observations = frame.copy(deep=False).sort_values("datetime")
+    if frequency != "daily":
+        periods = observations["datetime"].dt.to_period(
+            "W" if frequency == "weekly" else "M"
+        )
+        observations = (
+            observations.assign(_period=periods)
+            .groupby("_period", sort=True)
+            .tail(1)
+            .drop(columns="_period")
+        )
+    observations = observations.reset_index(drop=True)
+    if max_rows is not None:
+        observations = observations.tail(max_rows).reset_index(drop=True)
+    return observations
+
+
+@mcp.tool()
+def list_indices() -> dict[str, Any]:
+    """List the index codes supported by the installed EGX data package.
+
+    Returns canonical index codes and a one-line description for each. Use
+    these codes with the history, summary, and comparison tools.
+    """
+    codes = egx_client.supported_indices()
+    indices = [
+        {
+            "code": code,
+            "description": INDEX_DESCRIPTIONS.get(
+                code, f"{code} index published by the Egyptian Exchange."
+            ),
+        }
+        for code in codes
+    ]
+    return {"index": None, "as_of": None, "source": SOURCE, "indices": indices}
+
+
+@mcp.tool()
+async def get_index_history(
+    index: str,
+    period_days: int = 30,
+    frequency: Literal["daily", "weekly", "monthly"] = "daily",
+    max_rows: int | None = None,
+) -> dict[str, Any]:
+    """Return daily or downsampled historical EGX index values as ISO-date rows.
+
+    ``index`` is matched case-insensitively and ``period_days`` is clamped to
+    1-1825 calendar days. ``frequency`` keeps the last observation per day,
+    week, or month; choose weekly/monthly for long periods to reduce payload
+    size. ``max_rows`` optionally keeps only the most recent positive number of
+    rows. The source provides ``datetime`` and ``value``, not OHLC fields.
+    """
+    if frequency not in ("daily", "weekly", "monthly"):
+        return _return_error(
+            "INVALID_ARGUMENT",
+            "frequency must be 'daily', 'weekly', or 'monthly'.",
+            index,
+        )
+    loaded = await _load(index, period_days)
+    if isinstance(loaded, dict):
+        return loaded
+    canonical, period, frame = loaded
+    try:
+        sampled = _sample_history(frame, frequency, max_rows)
+    except ValueError as exc:
+        return _return_error("INVALID_ARGUMENT", str(exc), canonical)
+    rows = analytics.history_rows(sampled)
+    as_of = rows[-1]["date"] if rows else None
+    return {
+        "index": canonical,
+        "as_of": as_of,
+        "source": SOURCE,
+        "rows": rows,
+        "period_days_applied": period,
+        "observations": len(rows),
+    }
+
+
+@mcp.tool()
+async def get_index_summary(index: str, period_days: int = 90) -> dict[str, Any]:
+    """Calculate recent performance and risk statistics for one EGX index.
+
+    Returns latest value, previous close, daily move, period high/low and
+    return, 20/50-observation simple moving averages when enough data exists,
+    annualized volatility, drawdown from the period high, return over the last
+    five observations when available, and the valid observation date range.
+    ``period_days`` is a calendar-day lookback clamped to 1-1825.
+    """
+    loaded = await _load(index, period_days)
+    if isinstance(loaded, dict):
+        return loaded
+    canonical, period, frame = loaded
+    summary = analytics.summarize(frame)
+    return {
+        "index": canonical,
+        **summary,
+        "source": SOURCE,
+        "period_days_applied": period,
+        "observations": len(frame),
+    }
+
+
+@mcp.tool()
+async def compare_indices(
+    indices: list[str],
+    period_days: int = 90,
+) -> dict[str, Any]:
+    """Compare period return, volatility, and drawdown for EGX indices.
+
+    Index codes are case-insensitive; duplicates are removed while preserving
+    input order. The response includes each index's applied calendar-day
+    period and observation count, per-index errors without discarding
+    successful comparisons, and the best performer by period return.
+    """
+    if not isinstance(indices, list) or not indices:
+        return _return_error(
+            "INVALID_ARGUMENT",
+            "indices must be a non-empty list.",
+            [],
+        )
+    if any(not isinstance(index, str) for index in indices):
+        return _return_error(
+            "INVALID_ARGUMENT",
+            "every index code must be a string.",
+            indices,
+        )
+
+    unique_indices: list[str] = []
+    seen: set[str] = set()
+    for index in indices:
+        key = index.strip().casefold()
+        if key not in seen:
+            seen.add(key)
+            unique_indices.append(index)
+
+    try:
+        period = egx_client.clamp_period_days(period_days)
+    except egx_client.InvalidPeriodError as exc:
+        return _error_for(exc, unique_indices)
+    if len(unique_indices) > len(egx_client.supported_indices()):
+        return _return_error(
+            "INVALID_ARGUMENT",
+            "The number of unique requested indices exceeds the supported index count.",
+            unique_indices,
+        )
+
+    loaded_results = await asyncio.gather(
+        *(_load(index, period) for index in unique_indices)
+    )
+    comparisons: list[dict[str, Any]] = []
+    for requested_index, loaded in zip(unique_indices, loaded_results):
+        if isinstance(loaded, dict):
+            comparisons.append(
+                {
+                    "index": requested_index,
+                    "period_days_applied": period,
+                    "observations": 0,
+                    "period_return_pct": None,
+                    "annualized_volatility_pct": None,
+                    "drawdown_from_period_high_pct": None,
+                    "as_of": None,
+                    "error": loaded["error"],
+                }
+            )
+            continue
+
+        canonical, applied_period, frame = loaded
+        summary = analytics.summarize(frame)
+        comparisons.append(
+            {
+                "index": canonical,
+                "period_days_applied": applied_period,
+                "observations": len(frame),
+                "period_return_pct": summary["period_return_pct"],
+                "annualized_volatility_pct": summary[
+                    "annualized_volatility_pct"
+                ],
+                "drawdown_from_period_high_pct": summary[
+                    "drawdown_from_period_high_pct"
+                ],
+                "as_of": summary["as_of"],
+            }
+        )
+
+    candidates = [
+        row
+        for row in comparisons
+        if row.get("error") is None and row["period_return_pct"] is not None
+    ]
+    best = (
+        max(candidates, key=lambda row: row["period_return_pct"])["index"]
+        if candidates
+        else None
+    )
+    successful_dates = [
+        row["as_of"] for row in comparisons if row.get("error") is None and row["as_of"]
+    ]
+    return {
+        "index": [row["index"] for row in comparisons],
+        "as_of": max(successful_dates) if successful_dates else None,
+        "source": SOURCE,
+        "comparisons": comparisons,
+        "best_performer": best,
+    }
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def create_mcp_server(host: str, port: int) -> FastMCP:
+    """Create an independently configured MCP server with all EGX tools."""
+    server = _new_mcp(host, port)
+    for tool in (
+        list_indices,
+        get_index_history,
+        get_index_summary,
+        compare_indices,
+    ):
+        server.tool()(tool)
+    return server
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Start the MCP server over stdio or streamable HTTP."""
+    default_transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    if default_transport == "streamable-http":
+        default_transport = "http"
+    parser = argparse.ArgumentParser(description="Serve EGX index data over MCP.")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http", "streamable-http"),
+        default=default_transport,
+        help="MCP transport (default: stdio, or MCP_TRANSPORT).",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HOST", "127.0.0.1"),
+        help="HTTP bind host (default: MCP_HOST or 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=_port,
+        default=_port(os.getenv("MCP_PORT", "8000")),
+        help="HTTP bind port (default: MCP_PORT or 8000).",
+    )
+    args = parser.parse_args(argv)
+    transport = "http" if args.transport == "streamable-http" else args.transport
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+        return
+    from .http_app import create_app
+
+    token = os.getenv("MCP_AUTH_TOKEN")
+    http_server = create_mcp_server(args.host, args.port)
+    app = create_app({"": http_server}, auth_token=token)
+    import uvicorn
+
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
