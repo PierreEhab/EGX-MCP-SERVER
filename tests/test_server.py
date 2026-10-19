@@ -1,5 +1,7 @@
 import asyncio
 import inspect
+import logging
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
@@ -14,6 +16,7 @@ from egx_mcp.server import (
     get_index_summary,
     list_indices,
 )
+from egx_mcp import server as server_module
 from egx_mcp.http_app import create_app
 
 
@@ -284,3 +287,105 @@ def test_tool_errors_can_be_raised_for_mcp_error_results(
 
     with pytest.raises(ToolError, match="Unsupported index"):
         asyncio.run(get_index_summary("bad"))
+
+
+def test_compare_partial_failure_in_raise_mode_still_returns_successes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EGX_RAISE_TOOL_ERRORS", "true")
+    monkeypatch.setattr(
+        egx_client,
+        "supported_indices",
+        lambda: ["EGX30", "EGX70_EWI"],
+    )
+    monkeypatch.setattr(
+        egx_client,
+        "resolve_index",
+        lambda index: {"egx30": "EGX30", "egx70_ewi": "EGX70_EWI"}[index.casefold()],
+    )
+
+    def fetch(index: str, period_days: int) -> pd.DataFrame:
+        if index == "EGX70_EWI":
+            raise egx_client.EGXNetworkError("EGX70_EWI unavailable")
+        return make_frame([100.0, 110.0])
+
+    monkeypatch.setattr(egx_client, "fetch_index_data", fetch)
+
+    result = asyncio.run(compare_indices(["egx30", "EGX70_EWI"]))
+
+    assert result["best_performer"] == "EGX30"
+    assert len(result["comparisons"]) == 2
+    assert result["comparisons"][1]["error"]["code"] == "NETWORK_ERROR"
+    assert result["comparisons"][0]["period_return_pct"] == 10.0
+
+
+def test_compare_does_not_raise_when_success_has_null_return_in_raise_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EGX_RAISE_TOOL_ERRORS", "true")
+    monkeypatch.setattr(
+        egx_client,
+        "supported_indices",
+        lambda: ["EGX30", "EGX70_EWI"],
+    )
+    monkeypatch.setattr(
+        egx_client,
+        "resolve_index",
+        lambda index: {"egx30": "EGX30", "egx70_ewi": "EGX70_EWI"}[
+            index.casefold()
+        ],
+    )
+
+    def fetch(index: str, period_days: int) -> pd.DataFrame:
+        if index == "EGX70_EWI":
+            raise egx_client.EGXNetworkError("EGX70_EWI unavailable")
+        return make_frame([0.0, 0.0])
+
+    monkeypatch.setattr(egx_client, "fetch_index_data", fetch)
+
+    result = asyncio.run(compare_indices(["EGX30", "EGX70_EWI"]))
+
+    assert result["comparisons"][0]["period_return_pct"] is None
+    assert "error" not in result["comparisons"][0]
+    assert result["comparisons"][1]["error"]["code"] == "NETWORK_ERROR"
+
+
+def test_mcp_server_factory_is_lazy_and_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    factory = Mock(return_value=sentinel)
+    monkeypatch.setattr(server_module, "_mcp", None)
+    monkeypatch.setattr(server_module, "create_mcp_server", factory)
+
+    assert server_module.mcp is sentinel
+    assert server_module.mcp is sentinel
+    factory.assert_called_once_with("127.0.0.1", 8000)
+
+
+def test_server_configuration_uses_module_logger(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("MCP_ALLOWED_HOSTS", "market.example.com")
+
+    with caplog.at_level(logging.INFO, logger=server_module.__name__):
+        create_mcp_server("0.0.0.0", 8000)
+
+    assert any(
+        record.name == server_module.__name__
+        and record.getMessage().startswith("HTTP allowed hosts:")
+        for record in caplog.records
+    )
+
+
+def test_configure_logging_warns_and_falls_back_for_invalid_levels(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("EGX_LOG_LEVEL", "not-a-level")
+    from egx_mcp import egx_client
+
+    egx_client.configure_logging()
+
+    assert logging.getLogger().level == logging.INFO
+    assert "EGX_LOG_LEVEL" in caplog.text

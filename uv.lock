@@ -407,6 +407,9 @@ dependencies = [
     { name = "mcp" },
     { name = "pandas" },
     { name = "requests" },
+    { name = "starlette" },
+    { name = "tzdata" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -420,6 +423,9 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.26,<2" },
     { name = "pandas", specifier = ">=3.0.6" },
     { name = "requests", specifier = ">=2.31" },
+    { name = "starlette", specifier = ">=0.37" },
+    { name = "tzdata", specifier = ">=2024.1" },
+    { name = "uvicorn", specifier = ">=0.30" },
 ]
 
 [package.metadata.requires-dev]

@@ -25,7 +25,7 @@ class BearerAuthMiddleware:
 
     def __init__(self, app: ASGIApp, token: str) -> None:
         self.app = app
-        self.expected = f"Bearer {token}".encode("utf-8")
+        self.expected = token.encode("utf-8")
 
     async def __call__(
         self,
@@ -45,7 +45,8 @@ class BearerAuthMiddleware:
             ),
             b"",
         )
-        if not hmac.compare_digest(supplied, self.expected):
+        token = supplied[7:] if supplied[:7].lower() == b"bearer " else b""
+        if not hmac.compare_digest(token, self.expected):
             response = JSONResponse(
                 {"error": "Unauthorized"},
                 status_code=401,
@@ -101,6 +102,16 @@ def create_app(
     token = auth_token or os.getenv("MCP_AUTH_TOKEN")
     for host in {server.settings.host for server in servers.values()}:
         validate_http_security(host, token)
+
+    allowed_hosts: list[str] = []
+    for server in servers.values():
+        transport_security = getattr(server.settings, "transport_security", None)
+        allowed_hosts.extend(getattr(transport_security, "allowed_hosts", []))
+    if allowed_hosts:
+        _logger.info(
+            "Effective HTTP allowed hosts: %s",
+            ", ".join(sorted(set(allowed_hosts))),
+        )
 
     server_apps = {
         server: server.streamable_http_app()

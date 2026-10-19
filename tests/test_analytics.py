@@ -3,6 +3,7 @@ import math
 import pandas as pd
 
 from egx_mcp.analytics import history_rows, summarize
+from egx_mcp.server import _sample_history
 
 
 def frame(values: list[float | None]) -> pd.DataFrame:
@@ -112,10 +113,33 @@ def test_history_omits_rows_with_invalid_dates_or_values() -> None:
 
 
 def test_drawdown_and_five_observation_return() -> None:
-    result = summarize(frame([100, 120, 90, 100, 110]))
+    result = summarize(frame([100, 120, 90, 100, 110, 115]))
 
-    assert math.isclose(result["drawdown_from_period_high_pct"], -8.3333333333)
-    assert math.isclose(result["return_5d_pct"], 10.0)
+    assert math.isclose(result["drawdown_from_period_high_pct"], -4.1666666667)
+    assert math.isclose(result["return_5d_pct"], 15.0)
+
+
+def test_weekly_sampling_uses_thursday_week_ends() -> None:
+    dates = pd.to_datetime(
+        [
+            "2026-10-04",
+            "2026-10-05",
+            "2026-10-07",
+            "2026-10-08",
+            "2026-10-11",
+            "2026-10-12",
+            "2026-10-15",
+        ]
+    )
+    data = pd.DataFrame({"datetime": dates, "value": [100, 101, 102, 103, 104, 105, 106]})
+
+    sampled = _sample_history(data, "weekly", None)
+
+    assert sampled["datetime"].dt.date.tolist() == [
+        pd.Timestamp("2026-10-08").date(),
+        pd.Timestamp("2026-10-15").date(),
+    ]
+    assert sampled["value"].tolist() == [103.0, 106.0]
 
 
 def test_drawdown_and_five_observation_return_for_short_series() -> None:
@@ -126,5 +150,5 @@ def test_drawdown_and_five_observation_return_for_short_series() -> None:
     assert zero["drawdown_from_period_high_pct"] == 0.0
 
     four = summarize(frame([100, 110, 105, 108]))
-    assert four["drawdown_from_period_high_pct"] == -100 * (1 - 108 / 110)
+    assert math.isclose(four["drawdown_from_period_high_pct"], -100 * (1 - 108 / 110))
     assert four["return_5d_pct"] is None

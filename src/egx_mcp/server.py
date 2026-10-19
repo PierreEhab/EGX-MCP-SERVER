@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
+import threading
 from typing import Any, Literal, Sequence
 
 import pandas as pd
@@ -14,12 +16,17 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from . import analytics, egx_client
 from .constants import INDEX_DESCRIPTIONS
+from .http_app import _is_loopback
 
 SOURCE = egx_client.SOURCE
+_logger = logging.getLogger(__name__)
+_mcp: FastMCP | None = None
+_mcp_lock = threading.Lock()
 
 
 def _transport_security(host: str) -> TransportSecuritySettings | None:
     configured_hosts = os.getenv("MCP_ALLOWED_HOSTS")
+    token = os.getenv("MCP_AUTH_TOKEN")
     if configured_hosts is not None:
         allowed_hosts = [
             entry.strip() for entry in configured_hosts.split(",") if entry.strip()
@@ -47,7 +54,16 @@ def _transport_security(host: str) -> TransportSecuritySettings | None:
             ],
             allowed_origins=allowed_origins,
         )
-    if host in ("localhost", "127.0.0.1", "::1"):
+    if token and not _is_loopback(host):
+        _logger.warning(
+            "MCP_AUTH_TOKEN is set for a non-loopback bind; disabling DNS-rebinding protection because bearer auth is enabled and MCP_ALLOWED_HOSTS is unset."
+        )
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+            allowed_hosts=[],
+            allowed_origins=[],
+        )
+    if _is_loopback(host):
         return None
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -78,6 +94,12 @@ def _transport_security(host: str) -> TransportSecuritySettings | None:
 
 
 def _new_mcp(host: str, port: int) -> FastMCP:
+    settings = _transport_security(host)
+    if settings is not None:
+        _logger.info(
+            "HTTP allowed hosts: %s",
+            settings.allowed_hosts or "(disabled)",
+        )
     return FastMCP(
         "egx-mcp-server",
         instructions=(
@@ -86,13 +108,8 @@ def _new_mcp(host: str, port: int) -> FastMCP:
         ),
         host=host,
         port=port,
-        transport_security=_transport_security(host),
+        transport_security=settings,
     )
-
-mcp = _new_mcp(
-    os.getenv("MCP_HOST", "127.0.0.1"),
-    8000,
-)
 
 
 def _error(
@@ -113,9 +130,15 @@ def _return_error(
     message: str,
     index: str | list[str] | None = None,
 ) -> dict[str, Any]:
-    if os.getenv("EGX_RAISE_TOOL_ERRORS", "").casefold() == "true":
-        raise ToolError(message)
     return _error(error_code, message, index)
+
+
+def _maybe_raise_tool_error(payload: dict[str, Any]) -> dict[str, Any]:
+    if os.getenv("EGX_RAISE_TOOL_ERRORS", "").casefold() == "true":
+        error = payload.get("error")
+        if error:
+            raise ToolError(error["message"])
+    return payload
 
 
 def _error_for(
@@ -132,7 +155,7 @@ def _error_for(
         code = "INVALID_PERIOD"
     else:
         code = "DATA_SOURCE_ERROR"
-    return _return_error(code, str(exc), index)
+    return _error(code, str(exc), index)
 
 
 def _load_sync(index: str, period_days: int) -> tuple[str, int, pd.DataFrame]:
@@ -164,9 +187,8 @@ def _sample_history(
         raise ValueError("max_rows must be a positive integer or None.")
     observations = frame.copy(deep=False).sort_values("datetime")
     if frequency != "daily":
-        periods = observations["datetime"].dt.to_period(
-            "W" if frequency == "weekly" else "M"
-        )
+        key = "W-THU" if frequency == "weekly" else "M"
+        periods = observations["datetime"].dt.to_period(key)
         observations = (
             observations.assign(_period=periods)
             .groupby("_period", sort=True)
@@ -179,7 +201,6 @@ def _sample_history(
     return observations
 
 
-@mcp.tool()
 def list_indices() -> dict[str, Any]:
     """List the index codes supported by the installed EGX data package.
 
@@ -199,7 +220,6 @@ def list_indices() -> dict[str, Any]:
     return {"index": None, "as_of": None, "source": SOURCE, "indices": indices}
 
 
-@mcp.tool()
 async def get_index_history(
     index: str,
     period_days: int = 30,
@@ -215,22 +235,24 @@ async def get_index_history(
     rows. The source provides ``datetime`` and ``value``, not OHLC fields.
     """
     if frequency not in ("daily", "weekly", "monthly"):
-        return _return_error(
+        payload = _return_error(
             "INVALID_ARGUMENT",
             "frequency must be 'daily', 'weekly', or 'monthly'.",
             index,
         )
+        return _maybe_raise_tool_error(payload)
     loaded = await _load(index, period_days)
     if isinstance(loaded, dict):
-        return loaded
+        return _maybe_raise_tool_error(loaded)
     canonical, period, frame = loaded
     try:
         sampled = _sample_history(frame, frequency, max_rows)
     except ValueError as exc:
-        return _return_error("INVALID_ARGUMENT", str(exc), canonical)
+        payload = _return_error("INVALID_ARGUMENT", str(exc), canonical)
+        return _maybe_raise_tool_error(payload)
     rows = analytics.history_rows(sampled)
     as_of = rows[-1]["date"] if rows else None
-    return {
+    payload = {
         "index": canonical,
         "as_of": as_of,
         "source": SOURCE,
@@ -238,33 +260,33 @@ async def get_index_history(
         "period_days_applied": period,
         "observations": len(rows),
     }
+    return _maybe_raise_tool_error(payload)
 
 
-@mcp.tool()
 async def get_index_summary(index: str, period_days: int = 90) -> dict[str, Any]:
     """Calculate recent performance and risk statistics for one EGX index.
 
     Returns latest value, previous close, daily move, period high/low and
     return, 20/50-observation simple moving averages when enough data exists,
     annualized volatility, drawdown from the period high, return over the last
-    five observations when available, and the valid observation date range.
+    five sessions when available, and the valid observation date range.
     ``period_days`` is a calendar-day lookback clamped to 1-1825.
     """
     loaded = await _load(index, period_days)
     if isinstance(loaded, dict):
-        return loaded
+        return _maybe_raise_tool_error(loaded)
     canonical, period, frame = loaded
     summary = analytics.summarize(frame)
-    return {
+    payload = {
         "index": canonical,
         **summary,
         "source": SOURCE,
         "period_days_applied": period,
         "observations": len(frame),
     }
+    return _maybe_raise_tool_error(payload)
 
 
-@mcp.tool()
 async def compare_indices(
     indices: list[str],
     period_days: int = 90,
@@ -277,17 +299,19 @@ async def compare_indices(
     successful comparisons, and the best performer by period return.
     """
     if not isinstance(indices, list) or not indices:
-        return _return_error(
+        payload = _return_error(
             "INVALID_ARGUMENT",
             "indices must be a non-empty list.",
             [],
         )
+        return _maybe_raise_tool_error(payload)
     if any(not isinstance(index, str) for index in indices):
-        return _return_error(
+        payload = _return_error(
             "INVALID_ARGUMENT",
             "every index code must be a string.",
             indices,
         )
+        return _maybe_raise_tool_error(payload)
 
     unique_indices: list[str] = []
     seen: set[str] = set()
@@ -300,13 +324,15 @@ async def compare_indices(
     try:
         period = egx_client.clamp_period_days(period_days)
     except egx_client.InvalidPeriodError as exc:
-        return _error_for(exc, unique_indices)
+        payload = _error_for(exc, unique_indices)
+        return _maybe_raise_tool_error(payload)
     if len(unique_indices) > len(egx_client.supported_indices()):
-        return _return_error(
+        payload = _return_error(
             "INVALID_ARGUMENT",
             "The number of unique requested indices exceeds the supported index count.",
             unique_indices,
         )
+        return _maybe_raise_tool_error(payload)
 
     loaded_results = await asyncio.gather(
         *(_load(index, period) for index in unique_indices)
@@ -359,13 +385,24 @@ async def compare_indices(
     successful_dates = [
         row["as_of"] for row in comparisons if row.get("error") is None and row["as_of"]
     ]
-    return {
+    payload = {
         "index": [row["index"] for row in comparisons],
         "as_of": max(successful_dates) if successful_dates else None,
         "source": SOURCE,
         "comparisons": comparisons,
         "best_performer": best,
     }
+    if (
+        os.getenv("EGX_RAISE_TOOL_ERRORS", "").casefold() == "true"
+        and comparisons
+        and all("error" in row for row in comparisons)
+    ):
+        first_error = next(
+            (row.get("error", {"message": "Unknown error"}) for row in comparisons if row.get("error")),
+            {"message": "All requested indices failed."},
+        )
+        raise ToolError(first_error["message"])
+    return payload
 
 
 def _port(value: str) -> int:
@@ -391,8 +428,27 @@ def create_mcp_server(host: str, port: int) -> FastMCP:
     return server
 
 
+def get_mcp_server(host: str | None = None, port: int | None = None) -> FastMCP:
+    """Return the process's lazily constructed default MCP server."""
+    global _mcp
+    if _mcp is None:
+        with _mcp_lock:
+            if _mcp is None:
+                configured_host = host or os.getenv("MCP_HOST", "127.0.0.1")
+                configured_port = port or _port(os.getenv("MCP_PORT", "8000"))
+                _mcp = create_mcp_server(configured_host, configured_port)
+    return _mcp
+
+
+def __getattr__(name: str) -> Any:
+    if name == "mcp":
+        return get_mcp_server()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Start the MCP server over stdio or streamable HTTP."""
+    egx_client.configure_logging()
     default_transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
     if default_transport == "streamable-http":
         default_transport = "http"
@@ -417,12 +473,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     transport = "http" if args.transport == "streamable-http" else args.transport
     if transport == "stdio":
-        mcp.run(transport="stdio")
+        server = get_mcp_server(args.host, args.port)
+        server.run(transport="stdio")
         return
     from .http_app import create_app
 
     token = os.getenv("MCP_AUTH_TOKEN")
-    http_server = create_mcp_server(args.host, args.port)
+    http_server = get_mcp_server(args.host, args.port)
     app = create_app({"": http_server}, auth_token=token)
     import uvicorn
 

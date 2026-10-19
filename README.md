@@ -152,3 +152,9 @@ make network requests.
 ```console
 uv run pytest
 ```
+
+## Build distributions
+
+Use `python scripts/build.py` to run `uv build` and remove the
+`pyproject.toml.orig` compatibility backup that `uv_build` adds to source
+distributions. The generated wheel is left unchanged.

@@ -12,7 +12,9 @@ def _json_float(value: Any) -> float | None:
     if value is None or pd.isna(value):
         return None
     result = float(value)
-    return result if math.isfinite(result) else None
+    if not math.isfinite(result):
+        return None
+    return round(result, 12)
 
 
 def iso_date(value: Any) -> str | None:
@@ -89,11 +91,11 @@ def summarize(frame: pd.DataFrame) -> dict[str, Any]:
             if period_peak != 0
             else (0.0 if latest == 0 else None)
         )
-    return_5d = (
-        _json_float((latest / float(values.iloc[-5]) - 1) * 100)
-        if len(values) >= 5 and float(values.iloc[-5]) != 0
-        else None
-    )
+    return_5d = None
+    if len(values) >= 6:
+        comparison_value = values.iloc[-6]
+        if comparison_value not in (None, 0) and math.isfinite(float(comparison_value)):
+            return_5d = _json_float((latest / float(comparison_value) - 1) * 100)
 
     return {
         "as_of": iso_date(observations["datetime"].iloc[-1])

@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 import time
+from zoneinfo import ZoneInfoNotFoundError
 
 import pandas as pd
 import pytest
@@ -7,6 +9,26 @@ import requests
 
 from egx_mcp import egx_client
 from egx_mcp.cache import TTLCache
+
+
+def test_cairo_timezone_falls_back_to_utc_plus_two_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    egx_client._cairo_timezone.cache_clear()
+
+    def unavailable_zone(_: str):
+        raise ZoneInfoNotFoundError("Africa/Cairo")
+
+    monkeypatch.setattr(egx_client, "ZoneInfo", unavailable_zone)
+
+    first = egx_client._cairo_timezone()
+    second = egx_client._cairo_timezone()
+
+    assert first is second
+    assert datetime(2026, 1, 1, tzinfo=first).utcoffset() == timedelta(hours=2)
+    assert caplog.text.count("Africa/Cairo timezone data is unavailable") == 1
+    egx_client._cairo_timezone.cache_clear()
 
 
 def test_index_resolution_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:

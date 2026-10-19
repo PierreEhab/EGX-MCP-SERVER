@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: egx-mcp
+    runtime: python
+    plan: free
+    buildCommand: uv sync --locked --no-dev
+    startCommand: uv run --no-sync egx-mcp-server --transport http --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MCP_ALLOWED_HOSTS
+        value: egx-mcp.onrender.com   # replace with your real hostname
+      - key: MCP_AUTH_TOKEN
+        sync: false

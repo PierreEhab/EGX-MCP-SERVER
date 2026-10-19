@@ -10,10 +10,11 @@ from starlette.testclient import TestClient
 from egx_mcp import egx_client
 from egx_mcp.http_app import (
     BearerAuthMiddleware,
+    _is_loopback,
     create_app,
     validate_http_security,
 )
-from egx_mcp.server import create_mcp_server
+from egx_mcp.server import _transport_security, create_mcp_server
 
 
 def test_auth_middleware_handles_non_ascii_header_and_health_is_exempt() -> None:
@@ -44,6 +45,43 @@ def test_auth_middleware_handles_non_ascii_header_and_health_is_exempt() -> None
     assert malformed.status_code == 401
     assert malformed.headers["www-authenticate"] == "Bearer"
     assert valid.status_code == 200
+
+
+def test_auth_middleware_accepts_non_ascii_bearer_token_bytes() -> None:
+    received: list[dict[str, object]] = []
+
+    async def app(scope, receive, send):
+        received.append({"status": 200})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        received.append(message)
+
+    middleware = BearerAuthMiddleware(app, token="café")
+    scope = {
+        "type": "http",
+        "path": "/private",
+        "headers": [(b"authorization", b"bEaReR caf\xc3\xa9")],
+    }
+
+    asyncio.run(middleware(scope, receive, send))
+
+    assert received == [{"status": 200}]
+
+
+def test_localhost_subdomain_is_not_treated_as_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "test-token")
+
+    assert not _is_loopback("localhost.example.com")
+    settings = _transport_security("localhost.example.com")
+    assert settings is not None
+    assert settings.enable_dns_rebinding_protection is False
+    assert settings.allowed_hosts == []
 
 
 def test_http_configuration_warns_and_refuses_insecure_bind(

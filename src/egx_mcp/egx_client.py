@@ -9,7 +9,9 @@ import sys
 import threading
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone, tzinfo
+from functools import lru_cache
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import egx
 import pandas as pd
@@ -19,17 +21,40 @@ from .cache import TTLCache
 
 SOURCE = "EGX via egx package"
 
-_log_level_name = os.getenv("EGX_LOG_LEVEL", "INFO").upper()
-_log_level = getattr(logging, _log_level_name, None)
-if not isinstance(_log_level, int):
-    raise ValueError("EGX_LOG_LEVEL must be a valid logging level")
-logging.basicConfig(
-    level=_log_level,
-    stream=sys.stderr,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    force=True,
-)
+
+def configure_logging() -> None:
+    """Apply logging configuration for the EGX client without crashing on bad values."""
+    level_name = os.getenv("EGX_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        logging.warning(
+            "EGX_LOG_LEVEL=%r is invalid; defaulting to INFO.",
+            os.getenv("EGX_LOG_LEVEL", "INFO"),
+        )
+        level = logging.INFO
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=level,
+            stream=sys.stderr,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    else:
+        logging.getLogger().setLevel(level)
+
+
 _logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _cairo_timezone() -> tzinfo:
+    """Load Cairo's timezone once, falling back to fixed UTC+2 if unavailable."""
+    try:
+        return ZoneInfo("Africa/Cairo")
+    except ZoneInfoNotFoundError:
+        _logger.warning(
+            "Africa/Cairo timezone data is unavailable; falling back to fixed UTC+2."
+        )
+        return timezone(timedelta(hours=2), name="UTC+02:00")
 
 
 class EGXClientError(Exception):
@@ -167,7 +192,9 @@ def fetch_index_data(index: str, period_days: int) -> pd.DataFrame:
                     )
                 cached = _CachedFrame(
                     period_days=period,
-                    requested_on=pd.Timestamp(datetime.now().date()),
+                    requested_on=pd.Timestamp(
+                        datetime.now(_cairo_timezone()).date()
+                    ),
                     frame=normalized,
                 )
                 _DATA_CACHE.set(cache_key, cached)
