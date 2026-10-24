@@ -9,3 +9,8 @@ wheels/
 
 # Virtual environments
 .venv/
+
+# Local IDE and environment configuration
+.idea/
+.vscode/
+.env
