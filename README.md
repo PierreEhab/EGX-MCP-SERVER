@@ -1,9 +1,10 @@
 # EGX MCP Server
 
-A Python MCP server for retrieving and analyzing Egyptian Exchange (EGX) index
-data through the [`egx`](https://pypi.org/project/egx/) package. It supports
-Python 3.11+, is managed with `uv`, and uses the official MCP Python SDK,
-pandas, and requests.
+A Python MCP server for retrieving and analyzing Egyptian Exchange (EGX)
+indices and individual company stocks. Index data comes from the
+[`egx`](https://pypi.org/project/egx/) package; delayed daily stock data comes
+from Yahoo Finance through `yfinance`. It supports Python 3.11+, is managed
+with `uv`, and uses the official MCP Python SDK.
 
 The EGX market generally trades Sunday-Thursday, 10:00-14:15 Cairo time.
 Consequently, the latest available observation can be from the previous
@@ -20,6 +21,15 @@ The EGX source response is cached in memory for five minutes by default.
 `EGX_CACHE_TTL_SECONDS` changes this duration; `0` disables the cache. When a
 longer period is already cached, shorter requests are sliced from that result.
 Concurrent requests for the same index are coalesced.
+
+Stock bars and dividend history are cached persistently in SQLite. The stock
+cache database is `stock_cache.sqlite3` in `EGX_CACHE_DIR`, or by default
+`%LOCALAPPDATA%\egx-mcp` on Windows when `LOCALAPPDATA` is set, and
+`~/.cache/egx-mcp` otherwise.
+Completed daily bars are not cached or returned until 30 minutes after the
+EGX session close (14:15 Cairo time); a still-forming daily bar is excluded.
+Dividend history has a separate seven-day cache lifetime. Yahoo calls are
+serialized and throttled, with a configurable minimum interval.
 
 ## Run
 
@@ -64,7 +74,8 @@ any port for that host.
 | Variable | Default | Purpose |
 |---|---|---|
 | `EGX_CACHE_TTL_SECONDS` | `300` | Source-data cache TTL in seconds; `0` disables caching. |
-| `EGX_INDEX_LIST_TTL_SECONDS` | Not used | No list cache is needed: installed `egx.get_supported_indices()` returns a local constant and does not make a network request. |
+| `EGX_CACHE_DIR` | `%LOCALAPPDATA%\egx-mcp` on Windows when available; `~/.cache/egx-mcp` otherwise | Directory for the persistent SQLite stock cache. |
+| `EGX_YAHOO_MIN_INTERVAL_SECONDS` | `0.5` | Minimum delay between Yahoo calls; rate-limit responses are retried with backoff. |
 | `EGX_LOG_LEVEL` | `INFO` | Python logging level; source errors are logged to stderr so stdio MCP stays clean. |
 | `EGX_RAISE_TOOL_ERRORS` | `false` | With `true`, raise the MCP SDK `ToolError` so MCP clients receive `isError`; otherwise return the existing structured error payload. |
 | `MCP_TRANSPORT` | `stdio` | Default transport: `stdio`, `http`, or `streamable-http`. |
@@ -74,15 +85,54 @@ any port for that host.
 | `MCP_ALLOW_INSECURE` | `false` | Explicitly allow a non-loopback HTTP bind without a token. |
 | `MCP_ALLOWED_HOSTS` | SDK/local defaults | Comma-separated Host-header allow-list for MCP DNS-rebinding protection. |
 
-## Claude Desktop configuration
+## Windows stdio client configuration
 
-Use the absolute path to this project directory in `--directory`. For example,
-on Windows:
+For all clients, point `--directory` at the absolute project path. Replace
+`C:\\path\\to\\EGX-MCP-SERVER` with the directory containing this checkout.
+The server uses stdio; its library output is kept off stdout so it does not
+interfere with the MCP protocol.
+
+### Claude Desktop
+
+Add this to Claude Desktop's `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "egx": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:\\path\\to\\EGX-MCP-SERVER",
+        "run",
+        "egx-mcp-server"
+      ]
+    }
+  }
+}
+```
+
+### Claude Code
+
+Run this in PowerShell from the project directory to register the local server
+with Claude Code:
+
+```powershell
+claude mcp add --transport stdio egx -- uv --directory "$PWD" run egx-mcp-server
+```
+
+Alternatively replace `$PWD` with the absolute project path.
+
+### VS Code
+
+Create `.vscode\mcp.json` in the project directory (or merge the server entry
+into your existing MCP configuration):
+
+```json
+{
+  "servers": {
+    "egx": {
+      "type": "stdio",
       "command": "uv",
       "args": [
         "--directory",
@@ -122,12 +172,47 @@ provide the token in the Inspector's authorization settings.
 - `compare_indices(indices, period_days=90)` — compare period return,
   annualized volatility, and drawdown; duplicate codes are removed and a
   failing index is reported without discarding successful comparisons.
+- `list_stocks(sector=None, limit=50, include_unavailable=False, verbose=False)` — list
+  catalog companies. Unavailable Yahoo symbols are hidden by default;
+  `include_unavailable=true` adds them with an `unavailable` flag. Inferred
+  sectors are proposals, identified by `sector_source`. Catalog rows are
+  compact by default; `verbose=true` includes the full catalog record.
+- `find_stock(query, verbose=False)` — search available companies by ticker,
+  alias, or name. Results are compact unless `verbose=true`.
+- `get_stock_history(symbol, period_days=90, frequency="daily", max_rows=None,
+  adjusted=False)` — return daily OHLCV bars or Thursday-based weekly/monthly
+  samples. The lookback is clamped to 1-9000 calendar days. `Close` is
+  split-adjusted; `adjusted=true` returns dividend-adjusted `Adj Close` as the
+  row close.
+- `get_stock_summary(symbol, period_days=365)` — summarize price and total
+  returns, changes, moving averages, volatility, drawdowns, volume, 52-week
+  levels, and trailing dividend yield when available.
+- `get_stock_fundamentals(symbol)` — return catalog sector and best-effort
+  Yahoo market capitalization, P/E, 52-week range, and currency, plus
+  history-derived dividend yield and average volume. Missing values remain
+  null and are noted in `data_quality`.
+- `get_dividends(symbol, years=5)` — return available historical dividend
+  payments filtered to 1-50 years (`years` is clamped to that range).
+- `compare_stocks(symbols, period_days=365)` — compare up to 10 unique
+  companies by dividend-adjusted total return, with volatility, drawdown, and
+  per-symbol errors.
+- `stock_vs_index(symbol, index="EGX30", period_days=365)` — compare daily
+  stock and index returns on common dates, including correlation, beta, and
+  excess return.
+- `analysis_snapshot(symbol)` — compact stock summary, relative performance,
+  fundamentals, recent dividends, key price levels, and data-quality notes.
 
-Successful history and summary responses include `index`, `as_of`, `source`,
-`period_days_applied`, and `observations`. Each comparison row includes
-`period_days_applied` and `observations`. `as_of` is the latest valid
-observation used. The data source currently provides daily `datetime` and
-`value` fields, not OHLC candles.
+The `research_company(symbol)` and `build_trade_plan(symbol, horizon,
+risk_tolerance)` MCP prompts guide agents to call the relevant stock tools and
+produce structured research or scenario analysis. A prompt is guidance for an
+agent, not a substitute for reviewing the returned data.
+
+Index history and summary responses include `index`, `as_of`, `source`,
+`period_days_applied`, and `observations`. Stock history and summary responses
+include the corresponding `symbol` and stock price-basis metadata. Each
+comparison row includes `period_days_applied` and `observations`. `as_of` is
+the latest valid observation used. The EGX index source provides daily
+`datetime` and `value` fields, not OHLC candles.
 
 By default, errors retain the structured `error` object with a code and clear
 message. Set `EGX_RAISE_TOOL_ERRORS=true` to make the server raise the SDK
@@ -135,14 +220,27 @@ message. Set `EGX_RAISE_TOOL_ERRORS=true` to make the server raise the SDK
 
 ## Limitations
 
-- This server covers **indices only**; it does not provide individual stock
-  data.
-- It relies on the `egx` package, which may scrape the exchange website and
-  could break if that site changes.
-- The current package response contains daily `datetime` and `value` columns,
-  not open/high/low/close candles.
-- Source availability and the exchange's publication schedule determine how
-  recent the returned data is.
+- Yahoo stock prices are delayed and may be missing or stale for a company.
+  Catalog inclusion does not guarantee Yahoo coverage; tools report known
+  unavailable symbols explicitly. Stale or missing data should be reported,
+  never guessed.
+- Yahoo daily `Close` is split-adjusted and may differ from the historical
+  price actually traded after bonus shares or other splits. `Adj Close` is
+  additionally adjusted for dividends. Stock tools do not request intraday
+  bars.
+- Yahoo's sector, industry, dividend-yield, and average-volume fields may be
+  absent. Sectors come from the symbol catalog; inferred classifications are
+  marked as such. Dividend yield and average volume are computed from history
+  when the required data is available.
+- The EGX generally trades Sunday-Thursday; the source and exchange
+  publication schedule determine the latest available observation. No
+  Friday/Saturday bars are expected. EGX daily price limits and thin liquidity
+  for many names can affect interpretation.
+- Index data relies on the `egx` package, which may scrape the exchange
+  website and could break if that site changes. Its current response contains
+  daily `datetime` and `value` fields, not OHLC candles.
+
+**This service provides analysis, not financial advice.**
 
 ## Tests
 

@@ -91,6 +91,7 @@ def main() -> None:
         entry["yahoo_available"], entry["first_bar_date"], entry["last_bar_date"] = _coverage(
             entry["yahoo_ticker"]
         )
+        entry["catalog_checked_on"] = today.isoformat()
         last_call = time.monotonic()
         if entry["yahoo_available"]:
             available.append(entry["symbol"])

@@ -121,6 +121,57 @@ def test_yahoo_call_counter_counts_actual_wrapped_calls() -> None:
     assert stock_provider.yahoo_call_count() == before + 1
 
 
+def test_yahoo_calls_enforce_minimum_interval_with_fake_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(stock_provider, "_LAST_YAHOO_CALL", 0.0)
+    monkeypatch.setattr(stock_provider.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(stock_provider.time, "sleep", sleep)
+    monkeypatch.setattr(stock_provider, "_minimum_interval", lambda: 0.5)
+
+    assert stock_provider._yahoo_call("TEST", "test", lambda: "first") == "first"
+    assert stock_provider._yahoo_call("TEST", "test", lambda: "second") == "second"
+
+    assert sleeps == [0.5]
+    assert stock_provider._LAST_YAHOO_CALL == 10.5
+
+
+def test_rate_limit_retries_use_exponential_backoff_with_fake_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    sleeps: list[float] = []
+    attempts = [0]
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    def request() -> str:
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise RuntimeError("429 rate limit")
+        return "recovered"
+
+    monkeypatch.setattr(stock_provider, "_LAST_YAHOO_CALL", 0.0)
+    monkeypatch.setattr(stock_provider.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(stock_provider.time, "sleep", sleep)
+    monkeypatch.setattr(stock_provider, "_minimum_interval", lambda: 0.0)
+    monkeypatch.setattr(stock_provider.random, "uniform", lambda low, high: 0.0)
+
+    assert stock_provider._yahoo_call("TEST", "test", request) == "recovered"
+
+    assert attempts == [2]
+    assert sleeps == [1.0]
+
+
 def test_yahoo_key_error_becomes_typed_data_source_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

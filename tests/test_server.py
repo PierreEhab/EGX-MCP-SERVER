@@ -363,6 +363,16 @@ def test_mcp_server_factory_is_lazy_and_cached(
     factory.assert_called_once_with("127.0.0.1", 8000)
 
 
+def test_mcp_server_instructions_describe_stock_data() -> None:
+    server = create_mcp_server("127.0.0.1", 8000)
+
+    instructions = server.instructions.casefold()
+    assert "stocks" in instructions
+    assert "yahoo" in instructions
+    assert "delayed daily bars" in instructions
+    assert "financial advice" in instructions
+
+
 def test_server_configuration_uses_module_logger(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

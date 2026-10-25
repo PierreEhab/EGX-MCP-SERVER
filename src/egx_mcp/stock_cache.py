@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import sqlite3
 import threading
@@ -22,6 +23,7 @@ _OVERLAP_TOLERANCE = 1e-6
 _MARKET_CLOSE = time(14, 15)
 _COMPLETION_DELAY = timedelta(minutes=30)
 _DIVIDEND_TTL = timedelta(days=7)
+_INFO_TTL = timedelta(hours=24)
 
 
 def _is_trading_day(value: date) -> bool:
@@ -106,6 +108,8 @@ class CachedStockProvider:
         self.database_path = database_path or cache_database_path()
         self._clock = clock or (lambda: datetime.now(_cairo_timezone()))
         self._lock = threading.RLock()
+        self._symbol_locks_guard = threading.Lock()
+        self._symbol_locks: dict[str, threading.RLock] = {}
         self._connection: sqlite3.Connection | None = None
         self.last_history_decision: dict[str, str | None] = {}
         self.last_dividend_decision: dict[str, str | None] = {}
@@ -177,7 +181,12 @@ class CachedStockProvider:
                 fetched_at TEXT NOT NULL,
                 last_bar_date TEXT,
                 dividends_fetched_at TEXT,
-                covered_from TEXT
+                covered_from TEXT,
+                info_fetched_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS company_info (
+                symbol TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
             );
             """
         )
@@ -191,12 +200,22 @@ class CachedStockProvider:
             )
         if "covered_from" not in meta_columns:
             self._connection.execute("ALTER TABLE meta ADD COLUMN covered_from TEXT")
+        if "info_fetched_at" not in meta_columns:
+            self._connection.execute("ALTER TABLE meta ADD COLUMN info_fetched_at TEXT")
         self._connection.commit()
 
     def close(self) -> None:
         """Close the SQLite connection; primarily useful for orderly shutdown."""
         with self._lock:
             self._close_connection()
+
+    def _symbol_lock(self, symbol: str) -> threading.RLock:
+        with self._symbol_locks_guard:
+            lock = self._symbol_locks.get(symbol)
+            if lock is None:
+                lock = threading.RLock()
+                self._symbol_locks[symbol] = lock
+            return lock
 
     def _close_connection(self) -> None:
         if self._connection is not None:
@@ -242,11 +261,14 @@ class CachedStockProvider:
     def _read_meta(
         self,
         symbol: str,
-    ) -> tuple[datetime, str | None, datetime | None, date | None] | None:
-        def read() -> tuple[datetime, str | None, datetime | None, date | None] | None:
+    ) -> tuple[datetime, str | None, datetime | None, date | None, datetime | None] | None:
+        def read() -> tuple[
+            datetime, str | None, datetime | None, date | None, datetime | None
+        ] | None:
             assert self._connection is not None
             row = self._connection.execute(
-                "SELECT fetched_at, last_bar_date, dividends_fetched_at, covered_from "
+                "SELECT fetched_at, last_bar_date, dividends_fetched_at, covered_from, "
+                "info_fetched_at "
                 "FROM meta WHERE symbol = ?",
                 (symbol,),
             ).fetchone()
@@ -256,6 +278,7 @@ class CachedStockProvider:
                     row[1],
                     datetime.fromisoformat(row[2]) if row[2] else None,
                     date.fromisoformat(row[3]) if row[3] else None,
+                    datetime.fromisoformat(row[4]) if row[4] else None,
                 )
                 if row
                 else None
@@ -332,6 +355,15 @@ class CachedStockProvider:
         self._safe_call_cache(write)
 
     def get_history(self, entry: dict[str, Any], period_days: int) -> pd.DataFrame:
+        """Return cached history while coalescing concurrent refreshes per symbol."""
+        with self._symbol_lock(entry["symbol"]):
+            return self._get_history_locked(entry, period_days)
+
+    def _get_history_locked(
+        self,
+        entry: dict[str, Any],
+        period_days: int,
+    ) -> pd.DataFrame:
         """Return bars excluding an in-progress session until 14:45 Cairo.
 
         Bars dated today are neither cached nor returned until the EGX session
@@ -482,6 +514,15 @@ class CachedStockProvider:
         )
 
     def get_dividends(self, entry: dict[str, Any], years: int) -> pd.DataFrame:
+        """Return cached dividends while coalescing fetches per symbol."""
+        with self._symbol_lock(entry["symbol"]):
+            return self._get_dividends_locked(entry, years)
+
+    def _get_dividends_locked(
+        self,
+        entry: dict[str, Any],
+        years: int,
+    ) -> pd.DataFrame:
         """Return dividends from SQLite when recent, fetching and storing on miss."""
         if isinstance(years, bool) or not isinstance(years, int) or years < 1:
             raise ValueError("years must be a positive integer.")
@@ -568,8 +609,67 @@ class CachedStockProvider:
         self._safe_call_cache(write)
 
     def get_info_light(self, entry: dict[str, Any]) -> dict[str, Any]:
-        """Delegate uncached lightweight company information to the source."""
-        return self.provider.get_info_light(entry)
+        """Return lightweight company information cached for 24 hours."""
+        symbol = entry["symbol"]
+        with self._symbol_lock(symbol):
+            if self._connection is None:
+                return self.provider.get_info_light(entry)
+            meta = self._read_meta(symbol)
+            cached = self._read_company_info(symbol)
+            now = self._clock()
+            fetched_at = meta[4] if meta else None
+            if (
+                cached is not None
+                and fetched_at is not None
+                and _as_datetime(now) - _as_datetime(fetched_at) <= _INFO_TTL
+            ):
+                return cached
+            info = self.provider.get_info_light(entry)
+            self._write_company_info(symbol, info)
+            return info
+
+    def _read_company_info(self, symbol: str) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            assert self._connection is not None
+            row = self._connection.execute(
+                "SELECT payload FROM company_info WHERE symbol = ?", (symbol,)
+            ).fetchone()
+            return json.loads(row[0]) if row else None
+
+        return self._safe_call_cache(read)
+
+    def _write_company_info(self, symbol: str, payload: dict[str, Any]) -> None:
+        def write() -> None:
+            assert self._connection is not None
+            fetched_at = _as_datetime(self._clock()).isoformat()
+            with self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO company_info (symbol, payload) VALUES (?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET payload=excluded.payload
+                    """,
+                    (symbol, json.dumps(payload, allow_nan=False)),
+                )
+                last_date = self._connection.execute(
+                    "SELECT last_bar_date FROM meta WHERE symbol = ?", (symbol,)
+                ).fetchone()
+                self._connection.execute(
+                    """
+                    INSERT INTO meta
+                        (symbol, fetched_at, last_bar_date, info_fetched_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        info_fetched_at=excluded.info_fetched_at
+                    """,
+                    (
+                        symbol,
+                        fetched_at,
+                        last_date[0] if last_date else None,
+                        fetched_at,
+                    ),
+                )
+
+        self._safe_call_cache(write)
 
 
 def _date_text(value: Any) -> str:

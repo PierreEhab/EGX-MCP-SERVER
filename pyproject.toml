@@ -1,7 +1,7 @@
 [project]
 name = "egx-mcp-server"
 version = "0.1.0"
-description = "MCP server for Egyptian Exchange index data"
+description = "MCP server for Egyptian Exchange index and stock data"
 readme = "README.md"
 authors = [
     { name = "Pierre", email = "pieer44@gmail.com" }

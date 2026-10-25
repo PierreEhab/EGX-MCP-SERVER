@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
+import time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -21,6 +24,7 @@ class FakeProvider:
         self.factory = factory
         self.history_calls: list[int] = []
         self.dividend_calls = 0
+        self.info_calls = 0
         self.dividend_factory = lambda years: pd.DataFrame(columns=["date", "amount"])
 
     def get_history(self, entry, period_days):
@@ -32,7 +36,8 @@ class FakeProvider:
         return self.dividend_factory(years)
 
     def get_info_light(self, entry):
-        return {"name": "Test"}
+        self.info_calls += 1
+        return {"name": f"Test {self.info_calls}"}
 
 
 def _frame(today, value=100.0, start_days=40):
@@ -80,6 +85,74 @@ def test_cache_miss_fetches_and_fresh_cache_is_a_hit(tmp_path: Path) -> None:
 
     assert len(first) == len(second)
     assert provider.history_calls == [30]
+    cached.close()
+
+
+def test_concurrent_cold_reads_for_symbol_use_single_provider_call(
+    tmp_path: Path,
+) -> None:
+    request_time = datetime(2026, 10, 25, 16, 0, tzinfo=CAIRO)
+    entered_provider = threading.Event()
+
+    class SlowProvider(FakeProvider):
+        def get_history(self, entry, period_days):
+            self.history_calls.append(period_days)
+            entered_provider.set()
+            time.sleep(0.1)
+            return self.factory(period_days)
+
+    provider = SlowProvider(lambda period: _frame(request_time.date()))
+    cached = CachedStockProvider(
+        provider,
+        database_path=tmp_path / "concurrent.sqlite3",
+        clock=_clock(request_time),
+    )
+    start = threading.Barrier(5)
+
+    def read():
+        start.wait()
+        return cached.get_history(ENTRY, 30)
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(lambda _: read(), range(5)))
+
+    assert entered_provider.is_set()
+    assert len(provider.history_calls) == 1
+    assert all(not result.empty for result in results)
+    cached.close()
+
+
+def test_concurrent_cold_dividend_reads_for_symbol_use_single_provider_call(
+    tmp_path: Path,
+) -> None:
+    request_time = datetime(2026, 10, 25, 16, 0, tzinfo=CAIRO)
+    entered_provider = threading.Event()
+
+    class SlowProvider(FakeProvider):
+        def get_dividends(self, entry, years):
+            self.dividend_calls += 1
+            entered_provider.set()
+            time.sleep(0.1)
+            return self.dividend_factory(years)
+
+    provider = SlowProvider(lambda period: _frame(request_time.date()))
+    cached = CachedStockProvider(
+        provider,
+        database_path=tmp_path / "concurrent-dividends.sqlite3",
+        clock=_clock(request_time),
+    )
+    start = threading.Barrier(5)
+
+    def read():
+        start.wait()
+        return cached.get_dividends(ENTRY, 5)
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(lambda _: read(), range(5)))
+
+    assert entered_provider.is_set()
+    assert provider.dividend_calls == 1
+    assert all(result.empty for result in results)
     cached.close()
 
 
@@ -394,6 +467,27 @@ def test_dividend_ttl_is_separate_and_expires_after_seven_days(tmp_path: Path) -
     cached.get_dividends(ENTRY, 5)
 
     assert provider.dividend_calls == 2
+    cached.close()
+
+
+def test_company_info_is_cached_for_24_hours(tmp_path: Path) -> None:
+    first_now = datetime(2026, 10, 25, 16, 0, tzinfo=CAIRO)
+    provider = FakeProvider(lambda period: _frame(first_now.date(), start_days=365))
+    cached = CachedStockProvider(
+        provider,
+        database_path=tmp_path / "info.sqlite3",
+        clock=_clock(first_now),
+    )
+
+    first = cached.get_info_light(ENTRY)
+    second = cached.get_info_light(ENTRY)
+    assert first == second
+    assert provider.info_calls == 1
+
+    cached._clock = _clock(first_now + timedelta(hours=25))
+    third = cached.get_info_light(ENTRY)
+    assert third["name"] == "Test 2"
+    assert provider.info_calls == 2
     cached.close()
 
 
