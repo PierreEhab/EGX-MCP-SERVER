@@ -24,6 +24,24 @@ _MARKET_CLOSE = time(14, 15)
 _COMPLETION_DELAY = timedelta(minutes=30)
 _DIVIDEND_TTL = timedelta(days=7)
 _INFO_TTL = timedelta(hours=24)
+_INFO_FIELDS = {
+    "name",
+    "market_cap",
+    "trailing_pe",
+    "forward_pe",
+    "price_to_book",
+    "return_on_equity",
+    "profit_margins",
+    "operating_margins",
+    "dividend_yield",
+    "payout_ratio",
+    "total_debt",
+    "total_cash",
+    "week52_high",
+    "week52_low",
+    "currency",
+    "financial_currency",
+}
 
 
 def _is_trading_day(value: date) -> bool:
@@ -609,7 +627,7 @@ class CachedStockProvider:
         self._safe_call_cache(write)
 
     def get_info_light(self, entry: dict[str, Any]) -> dict[str, Any]:
-        """Return lightweight company information cached for 24 hours."""
+        """Return company information and fundamentals cached for 24 hours."""
         symbol = entry["symbol"]
         with self._symbol_lock(symbol):
             if self._connection is None:
@@ -620,6 +638,7 @@ class CachedStockProvider:
             fetched_at = meta[4] if meta else None
             if (
                 cached is not None
+                and _INFO_FIELDS.issubset(cached)
                 and fetched_at is not None
                 and _as_datetime(now) - _as_datetime(fetched_at) <= _INFO_TTL
             ):

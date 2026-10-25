@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from functools import wraps
 import logging
 import os
 import threading
 from datetime import date
+from functools import wraps
 from typing import Any, Literal, Sequence
 
 import pandas as pd
@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import analytics, egx_client
+from . import analytics, egx_client, macro_provider
 from .constants import INDEX_DESCRIPTIONS
 from .http_app import _is_loopback
 from .stock_cache import CachedStockProvider
@@ -434,7 +434,14 @@ async def get_stock_summary(
 
 @_guard_stock_tool
 async def get_stock_fundamentals(symbol: str) -> dict[str, Any]:
-    """Return best-effort catalog sector, Yahoo fundamentals, and computed metrics."""
+    """Return catalog and Yahoo fundamentals with history-derived dividend yield.
+
+    Yahoo ``return_on_equity``, margins, ``dividend_yield``, and ``payout_ratio``
+    are fractions (for example, 0.05 means 5%). The locally computed
+    ``dividend_yield_ttm`` is a percent (for example, 5.0 means 5%). P/E and
+    price-to-book are ratios; debt, cash, and market capitalization are in
+    Yahoo's reported currency units. Missing Yahoo fields remain null.
+    """
     try:
         entry = await asyncio.to_thread(_resolve_stock, symbol)
     except (
@@ -452,9 +459,19 @@ async def get_stock_fundamentals(symbol: str) -> dict[str, Any]:
             "name": None,
             "market_cap": None,
             "trailing_pe": None,
+            "forward_pe": None,
+            "price_to_book": None,
+            "return_on_equity": None,
+            "profit_margins": None,
+            "operating_margins": None,
+            "dividend_yield": None,
+            "payout_ratio": None,
+            "total_debt": None,
+            "total_cash": None,
             "week52_high": None,
             "week52_low": None,
             "currency": None,
+            "financial_currency": None,
         }
         quality_notes.append(f"Yahoo company information unavailable ({exc.code}).")
     try:
@@ -502,6 +519,29 @@ async def get_stock_fundamentals(symbol: str) -> dict[str, Any]:
         quality_notes.append(
             "Unavailable fields: " + ", ".join(dict.fromkeys(unavailable_fields)) + "."
         )
+    yahoo_dividend_yield_pct = (
+        info["dividend_yield"] * 100
+        if info["dividend_yield"] is not None
+        else None
+    )
+    dividend_yield_note = None
+    if yahoo_dividend_yield_pct is not None and dividend_yield is not None:
+        difference = abs(yahoo_dividend_yield_pct - dividend_yield)
+        smaller = min(abs(yahoo_dividend_yield_pct), abs(dividend_yield))
+        larger = max(abs(yahoo_dividend_yield_pct), abs(dividend_yield))
+        differs_by_100x = smaller > 0 and larger >= smaller * 100
+        if difference > 1.0 or differs_by_100x:
+            dividend_yield_note = (
+                "Yahoo dividend_yield and history-derived dividend_yield_ttm "
+                "differ by more than 1 percentage point or 100x; verify dates "
+                "and source coverage before comparing."
+            )
+            quality_notes.append(dividend_yield_note)
+    if entry["sector"] == "Financials":
+        quality_notes.append(
+            "For Financials-sector companies, especially banks, debt, cash, "
+            "and margins are not comparable to those of other sectors."
+        )
     return _maybe_raise_stock_error(
         {
             "symbol": entry["symbol"],
@@ -512,11 +552,41 @@ async def get_stock_fundamentals(symbol: str) -> dict[str, Any]:
             "sector_source": entry["sector_source"],
             "market_cap": info["market_cap"],
             "trailing_pe": info["trailing_pe"],
+            "valuation": {
+                "trailing_pe": info["trailing_pe"],
+                "forward_pe": info["forward_pe"],
+                "price_to_book": info["price_to_book"],
+            },
+            "profitability": {
+                "return_on_equity": info["return_on_equity"],
+                "profit_margins": info["profit_margins"],
+                "operating_margins": info["operating_margins"],
+            },
+            "dividends": {
+                "dividend_yield": info["dividend_yield"],
+                "payout_ratio": info["payout_ratio"],
+                "dividend_yield_ttm": dividend_yield,
+                "dividend_yield_ttm_unit": "percent",
+                "note": dividend_yield_note,
+            },
+            "balance_sheet": {
+                "total_debt": info["total_debt"],
+                "total_cash": info["total_cash"],
+            },
             "week52_high": info["week52_high"],
             "week52_low": info["week52_low"],
             "currency": info["currency"],
+            "financial_currency": info["financial_currency"],
             "dividend_yield_ttm": dividend_yield,
             "avg_volume_20d": average_volume,
+            "ratio_units": {
+                "return_on_equity": "fraction",
+                "profit_margins": "fraction",
+                "operating_margins": "fraction",
+                "dividend_yield": "fraction",
+                "payout_ratio": "fraction",
+                "dividend_yield_ttm": "percent",
+            },
             "data_quality": "; ".join(quality_notes) if quality_notes else None,
             "observations": metric_observations,
             "period_days_applied": 365,
@@ -872,14 +942,58 @@ async def analysis_snapshot(symbol: str) -> dict[str, Any]:
     }
 
 
+async def get_egypt_macro_data() -> dict[str, Any]:
+    """Fetch latest free FRED baseline data for Egypt macro-aware planning.
+
+    Requests the latest observation for FPCPITOTLZGEGY (annual consumer price
+    inflation), INTDSRTRM193N (discount rate), and DEXEGUS (EGP per USD).
+    Requires ``FRED_API_KEY``. Values include observation dates and may have
+    different publication frequencies; each metric includes its own error and
+    stale status, so one unavailable series does not hide successful series.
+    Returns a structured dictionary with an ``error`` payload only when all
+    series fail. Null values indicate unavailable data, not a forecast. Use
+    these indicators as context, not as financial advice.
+    """
+    try:
+        payload = await asyncio.to_thread(macro_provider.get_latest_egypt_macro_data)
+    except macro_provider.MissingFredApiKeyError as exc:
+        payload = {
+            "source": "FRED",
+            "error": {"code": exc.code, "message": str(exc)},
+        }
+    except macro_provider.MacroDataError as exc:
+        payload = {"source": "FRED", "error": {"code": exc.code, "message": str(exc)}}
+    except Exception as exc:
+        _logger.error(
+            "Unexpected failure in get_egypt_macro_data exception_class=%s",
+            type(exc).__name__,
+        )
+        payload = {
+            "source": "FRED",
+            "error": {
+                "code": "DATA_SOURCE_ERROR",
+                "message": "An unexpected Egypt macro data error occurred.",
+            },
+        }
+    if (
+        payload.get("error")
+        and os.getenv("EGX_RAISE_TOOL_ERRORS", "").casefold() == "true"
+    ):
+        raise ToolError(payload["error"]["message"])
+    return payload
+
+
 def research_company(symbol: str) -> str:
     """Prompt a structured EGX company research report using stock tools."""
     return f"""Research the EGX-listed company {symbol}.
 
-First call analysis_snapshot for {symbol}, get_stock_fundamentals for {symbol},
-and stock_vs_index for {symbol} against EGX30. Use the returned data and dates;
-do not infer facts that the tools do not provide. Then write a structured
-report with these sections:
+First call analysis_snapshot and get_stock_fundamentals for {symbol},
+stock_vs_index for {symbol} against EGX30, and get_egypt_macro_data for the
+current macro baseline. Use the returned data and dates; do not infer facts
+that the tools do not provide. If get_egypt_macro_data returns an error, or
+its metrics are stale, continue the analysis without the affected macro
+values and state that macro context is unavailable or stale.
+Then write a structured report with these sections:
 1. Trend: summarize price direction, returns, moving averages, and key levels.
 2. Risk: discuss volatility, drawdown, liquidity caveats, and relative
    performance against EGX30.
@@ -899,10 +1013,12 @@ def build_trade_plan(symbol: str, horizon: str, risk_tolerance: str) -> str:
 The user's stated horizon is {horizon}; stated risk tolerance is
 {risk_tolerance}.
 
-First call analysis_snapshot for {symbol}, get_stock_fundamentals for {symbol},
-get_stock_history for an appropriate period and frequency, and
-stock_vs_index for {symbol} against EGX30. Ground every price level in tool
-output and cite its as_of date. Then draft:
+First call analysis_snapshot and get_stock_fundamentals for {symbol};
+get_stock_history for an appropriate period and frequency; stock_vs_index for
+{symbol} against EGX30; and get_egypt_macro_data for macro context. If the
+macro tool returns an error, or its metrics are stale, continue without the
+affected macro values and state that macro context is unavailable or stale.
+Ground every price level in tool output and cite its as_of date. Then draft:
 1. Bull, base, and bear scenarios, with evidence and conditions that would
    support each scenario.
 2. Relevant support, resistance, and other key levels; distinguish observed
@@ -1000,7 +1116,8 @@ def _new_mcp(host: str, port: int) -> FastMCP:
             "Retrieve Egyptian Exchange index data and individual stocks "
             "through Yahoo Finance (delayed daily bars), use the analysis tools, "
             "and follow the research prompts for structured company research "
-            "or scenario planning. Results are analysis, not financial advice."
+            "or scenario planning. Use get_egypt_macro_data for free FRED "
+            "macroeconomic context. Results are analysis, not financial advice."
         ),
         host=host,
         port=port,
@@ -1328,6 +1445,7 @@ def create_mcp_server(host: str, port: int) -> FastMCP:
         compare_stocks,
         stock_vs_index,
         analysis_snapshot,
+        get_egypt_macro_data,
     ):
         server.tool()(tool)
     for prompt in (research_company, build_trade_plan):

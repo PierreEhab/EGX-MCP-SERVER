@@ -12,6 +12,7 @@ from egx_mcp.server import (
     analysis_snapshot,
     build_trade_plan,
     compare_stocks,
+    get_egypt_macro_data,
     find_stock,
     get_dividends,
     get_stock_fundamentals,
@@ -66,9 +67,19 @@ class FakeProvider:
             "name": "Yahoo name",
             "market_cap": 1000.0,
             "trailing_pe": None,
+            "forward_pe": None,
+            "price_to_book": None,
+            "return_on_equity": None,
+            "profit_margins": None,
+            "operating_margins": None,
+            "dividend_yield": None,
+            "payout_ratio": None,
+            "total_debt": None,
+            "total_cash": None,
             "week52_high": 500.0,
             "week52_low": 250.0,
             "currency": "EGP",
+            "financial_currency": None,
         }
 
 
@@ -136,6 +147,56 @@ def test_summary_and_fundamentals_have_requested_metadata(fake_provider) -> None
     assert fundamentals["avg_volume_20d"] is not None
     assert fundamentals["trailing_pe"] is None
     assert fundamentals["data_quality"]
+    assert set(fundamentals["valuation"]) == {
+        "trailing_pe",
+        "forward_pe",
+        "price_to_book",
+    }
+    assert "dividend_yield_ttm" in fundamentals["dividends"]
+    assert fundamentals["financial_currency"] is None
+
+
+def test_fundamentals_merge_yahoo_metrics_and_warn_on_yield_discrepancy(
+    fake_provider,
+) -> None:
+    def detailed_info(entry):
+        return {
+            **FakeProvider().get_info_light(entry),
+            "trailing_pe": 10.0,
+            "forward_pe": 9.0,
+            "price_to_book": 1.2,
+            "return_on_equity": 0.12,
+            "profit_margins": 0.15,
+            "operating_margins": 0.08,
+            "dividend_yield": 0.000001,
+            "payout_ratio": 0.4,
+            "total_debt": 200.0,
+            "total_cash": 80.0,
+            "financial_currency": "EGP",
+        }
+
+    fake_provider.get_info_light = detailed_info
+
+    result = asyncio.run(get_stock_fundamentals("COMI"))
+
+    assert result["valuation"] == {
+        "trailing_pe": 10.0,
+        "forward_pe": 9.0,
+        "price_to_book": 1.2,
+    }
+    assert result["profitability"]["return_on_equity"] == 0.12
+    assert result["dividends"]["dividend_yield"] == 0.000001
+    assert result["dividends"]["dividend_yield_ttm"] == result["dividend_yield_ttm"]
+    assert result["dividends"]["note"]
+    assert "100x" in result["dividends"]["note"]
+    assert result["balance_sheet"] == {"total_debt": 200.0, "total_cash": 80.0}
+    assert result["financial_currency"] == "EGP"
+    assert any(
+        "Financials-sector" in note
+        for note in result["data_quality"].split("; ")
+    )
+    assert result["ratio_units"]["return_on_equity"] == "fraction"
+    assert result["ratio_units"]["dividend_yield_ttm"] == "percent"
 
 
 def test_stale_status_uses_returned_bars_not_catalog_snapshot(
@@ -274,10 +335,14 @@ def test_stock_errors_return_typed_payload_and_raise_mode(
     fake_provider.fail_symbols.add("COMI")
     result = asyncio.run(get_stock_summary("COMI"))
     assert result["error"]["code"] == "EMPTY_DATA"
+    fundamentals_error = asyncio.run(get_stock_fundamentals("QNBE"))
+    assert fundamentals_error["error"]["code"] == "SYMBOL_UNAVAILABLE"
 
     monkeypatch.setenv("EGX_RAISE_TOOL_ERRORS", "true")
     with pytest.raises(ToolError, match="No stock data"):
         asyncio.run(get_stock_summary("COMI"))
+    with pytest.raises(ToolError, match="no data is available"):
+        asyncio.run(get_stock_fundamentals("QNBE"))
 
 
 def test_ambiguous_and_known_unavailable_symbols_are_not_not_found(monkeypatch) -> None:
@@ -350,7 +415,90 @@ def test_stock_tools_are_registered_with_fastmcp() -> None:
         "compare_stocks",
         "stock_vs_index",
         "analysis_snapshot",
+        "get_egypt_macro_data",
     }.issubset({tool.name for tool in tools})
+
+
+def test_egypt_macro_tool_requests_all_fred_series(monkeypatch, tmp_path) -> None:
+    from egx_mcp import macro_provider
+
+    monkeypatch.setenv("FRED_API_KEY", "test-api-key")
+    monkeypatch.setattr(
+        macro_provider,
+        "cache_database_path",
+        lambda: tmp_path / "stock_cache.sqlite3",
+    )
+    calls: list[dict] = []
+
+    class Response:
+        def __init__(self, series_id):
+            self.series_id = series_id
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "observations": [{"date": "2026-09-01", "value": "12.3"}]
+            }
+
+    def fake_get(url, params, timeout):
+        calls.append({"url": url, "params": params, "timeout": timeout})
+        return Response(params["series_id"])
+
+    monkeypatch.setattr(macro_provider.requests, "get", fake_get)
+    payload = asyncio.run(get_egypt_macro_data())
+
+    assert len(calls) == 3
+    assert {call["params"]["series_id"] for call in calls} == {
+        "FPCPITOTLZGEGY",
+        "INTDSRTRM193N",
+        "DEXEGUS",
+    }
+    assert all(call["params"]["api_key"] == "test-api-key" for call in calls)
+    assert all(call["params"]["limit"] == 10 for call in calls)
+    assert all(call["params"]["sort_order"] == "desc" for call in calls)
+    assert payload["source"] == "FRED"
+    assert isinstance(payload, dict)
+    assert payload["metrics"]["inflation"]["value"] == 12.3
+
+
+def test_egypt_macro_tool_returns_clear_missing_key_error(monkeypatch) -> None:
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+
+    payload = asyncio.run(get_egypt_macro_data())
+
+    assert payload["error"]["code"] == "MISSING_API_KEY"
+    assert "FRED_API_KEY" in payload["error"]["message"]
+
+
+def test_egypt_macro_tool_maps_source_errors_and_raise_mode(
+    monkeypatch,
+    caplog,
+    tmp_path,
+) -> None:
+    from egx_mcp import macro_provider
+
+    monkeypatch.setenv("FRED_API_KEY", "test-api-key")
+    monkeypatch.setattr(
+        macro_provider,
+        "cache_database_path",
+        lambda: tmp_path / "stock_cache.sqlite3",
+    )
+    monkeypatch.setattr(
+        macro_provider.requests,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("private response")),
+    )
+
+    result = asyncio.run(get_egypt_macro_data())
+    assert result["error"]["code"] == "DATA_SOURCE_ERROR"
+    assert "private response" not in result["error"]["message"]
+    assert "private response" not in caplog.text
+
+    monkeypatch.setenv("EGX_RAISE_TOOL_ERRORS", "true")
+    with pytest.raises(ToolError, match="All three FRED series requests failed"):
+        asyncio.run(get_egypt_macro_data())
 
 
 def test_research_prompts_include_workflow_and_required_caveats() -> None:
@@ -360,6 +508,7 @@ def test_research_prompts_include_workflow_and_required_caveats() -> None:
     for tool_name in (
         "analysis_snapshot",
         "get_stock_fundamentals",
+        "get_egypt_macro_data",
         "stock_vs_index",
     ):
         assert tool_name in company_prompt
@@ -373,6 +522,7 @@ def test_research_prompts_include_workflow_and_required_caveats() -> None:
         "trend",
         "risk",
         "valuation caveats",
+        "state that macro context is unavailable or stale",
     ):
         assert phrase.casefold() in company_prompt.casefold()
     for phrase in (
@@ -385,6 +535,7 @@ def test_research_prompts_include_workflow_and_required_caveats() -> None:
         "split-adjusted",
         "daily price limits",
         "thin liquidity",
+        "state that macro context is unavailable or stale",
         "stale or missing data",
     ):
         assert phrase.casefold() in trade_prompt.casefold()

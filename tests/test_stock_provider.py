@@ -252,7 +252,77 @@ def test_dividends_and_info_are_normalized_and_missing_values_stay_none(
         "name": "Test Company",
         "market_cap": 1000.0,
         "trailing_pe": None,
+        "forward_pe": None,
+        "price_to_book": None,
+        "return_on_equity": None,
+        "profit_margins": None,
+        "operating_margins": None,
+        "dividend_yield": None,
+        "payout_ratio": None,
+        "total_debt": None,
+        "total_cash": None,
         "week52_high": 20.0,
         "week52_low": None,
         "currency": "EGP",
+        "financial_currency": None,
+    }
+
+
+def test_info_light_returns_all_fundamentals_with_sparse_yahoo_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested: list[str] = []
+    info = {
+        "trailingPE": 12.5,
+        "forwardPE": None,
+        "priceToBook": 1.4,
+        "returnOnEquity": 0.15,
+        "profitMargins": 0.2,
+        "operatingMargins": None,
+        "dividendYield": 0.03,
+        "payoutRatio": 0.4,
+        "totalDebt": 1000,
+        "totalCash": 250,
+        "financialCurrency": "EGP",
+        "longName": "Test Company",
+        "marketCap": 12345,
+        "currency": "EGP",
+        "fiftyTwoWeekHigh": 200,
+        "fiftyTwoWeekLow": 100,
+    }
+
+    class TickerStub:
+        @property
+        def info(self):
+            return info
+
+    def ticker_factory(ticker):
+        requested.append(ticker)
+        return TickerStub()
+
+    monkeypatch.setattr(stock_provider.yf, "Ticker", ticker_factory)
+    monkeypatch.setattr(stock_provider, "_minimum_interval", lambda: 0)
+
+    result = YahooProvider().get_info_light(
+        {"symbol": "COMI", "yahoo_ticker": "COMI.CA"}
+    )
+
+    assert requested == ["COMI.CA"]
+    assert result == {
+        "name": "Test Company",
+        "market_cap": 12345.0,
+        "trailing_pe": 12.5,
+        "forward_pe": None,
+        "price_to_book": 1.4,
+        "return_on_equity": 0.15,
+        "profit_margins": 0.2,
+        "operating_margins": None,
+        "dividend_yield": 0.03,
+        "payout_ratio": 0.4,
+        "total_debt": 1000.0,
+        "total_cash": 250.0,
+        "week52_high": 200.0,
+        "week52_low": 100.0,
+        "currency": "EGP",
+        "financial_currency": "EGP",
     }

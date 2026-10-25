@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
+import sqlite3
 import threading
 import time
 from zoneinfo import ZoneInfo
@@ -37,7 +39,24 @@ class FakeProvider:
 
     def get_info_light(self, entry):
         self.info_calls += 1
-        return {"name": f"Test {self.info_calls}"}
+        return {
+            "name": f"Test {self.info_calls}",
+            "market_cap": None,
+            "trailing_pe": None,
+            "forward_pe": None,
+            "price_to_book": None,
+            "return_on_equity": None,
+            "profit_margins": None,
+            "operating_margins": None,
+            "dividend_yield": None,
+            "payout_ratio": None,
+            "total_debt": None,
+            "total_cash": None,
+            "week52_high": None,
+            "week52_low": None,
+            "currency": None,
+            "financial_currency": None,
+        }
 
 
 def _frame(today, value=100.0, start_days=40):
@@ -488,6 +507,27 @@ def test_company_info_is_cached_for_24_hours(tmp_path: Path) -> None:
     third = cached.get_info_light(ENTRY)
     assert third["name"] == "Test 2"
     assert provider.info_calls == 2
+    cached.close()
+
+
+def test_company_info_cache_refreshes_legacy_lightweight_payload(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 25, 16, 0, tzinfo=CAIRO)
+    database = tmp_path / "legacy-info.sqlite3"
+    source = FakeProvider(lambda period: _frame(now.date(), start_days=365))
+    cached = CachedStockProvider(
+        source,
+        database_path=database,
+        clock=_clock(now),
+    )
+    cached.get_info_light(ENTRY)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE company_info SET payload = ? WHERE symbol = ?",
+            (json.dumps({"name": "Legacy cache"}), ENTRY["symbol"]),
+        )
+    result = cached.get_info_light(ENTRY)
+    assert result["name"] == "Test 2"
+    assert source.info_calls == 2
     cached.close()
 
 

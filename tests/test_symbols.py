@@ -11,6 +11,7 @@ def test_resolves_code_yahoo_code_alias_and_name() -> None:
     assert symbols.resolve_symbol("ACTF.CA")["symbol"] == "ACTF"
     assert symbols.resolve_symbol("CIB")["symbol"] == "COMI"
     assert symbols.resolve_symbol("Telecom Egypt")["symbol"] == "ETEL"
+    assert symbols.resolve_symbol("Halan")["symbol"] == "HALN"
 
 
 def test_ambiguous_name_fragment_returns_candidates() -> None:

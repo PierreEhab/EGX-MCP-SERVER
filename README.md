@@ -76,6 +76,7 @@ any port for that host.
 | `EGX_CACHE_TTL_SECONDS` | `300` | Source-data cache TTL in seconds; `0` disables caching. |
 | `EGX_CACHE_DIR` | `%LOCALAPPDATA%\egx-mcp` on Windows when available; `~/.cache/egx-mcp` otherwise | Directory for the persistent SQLite stock cache. |
 | `EGX_YAHOO_MIN_INTERVAL_SECONDS` | `0.5` | Minimum delay between Yahoo calls; rate-limit responses are retried with backoff. |
+| `FRED_API_KEY` | Unset | Required for the free FRED macroeconomic data tool; obtain a key from FRED and set it in the server process environment. |
 | `EGX_LOG_LEVEL` | `INFO` | Python logging level; source errors are logged to stderr so stdio MCP stays clean. |
 | `EGX_RAISE_TOOL_ERRORS` | `false` | With `true`, raise the MCP SDK `ToolError` so MCP clients receive `isError`; otherwise return the existing structured error payload. |
 | `MCP_TRANSPORT` | `stdio` | Default transport: `stdio`, `http`, or `streamable-http`. |
@@ -106,11 +107,19 @@ Add this to Claude Desktop's `claude_desktop_config.json`:
         "C:\\path\\to\\EGX-MCP-SERVER",
         "run",
         "egx-mcp-server"
-      ]
+      ],
+      "env": {
+        "FRED_API_KEY": "your-fred-api-key"
+      }
     }
   }
 }
 ```
+
+Claude Desktop does not load the project's `.env` file automatically. Set
+`FRED_API_KEY` in the MCP server's `env` block as shown above (or provide it in
+the process environment before starting Claude Desktop); do not add the key to
+the repository's `.env` file expecting it to be loaded.
 
 ### Claude Code
 
@@ -188,9 +197,15 @@ provide the token in the Inspector's authorization settings.
   returns, changes, moving averages, volatility, drawdowns, volume, 52-week
   levels, and trailing dividend yield when available.
 - `get_stock_fundamentals(symbol)` — return catalog sector and best-effort
-  Yahoo market capitalization, P/E, 52-week range, and currency, plus
-  history-derived dividend yield and average volume. Missing values remain
-  null and are noted in `data_quality`.
+  Yahoo valuation (trailing/forward P/E and price-to-book), profitability,
+  dividends, balance-sheet metrics, 52-week range, currencies, and
+  history-derived dividend yield and average volume. Yahoo ROE, margins,
+  dividend yield and payout ratio are fractions; the computed trailing
+  dividend yield is a percent. Missing values remain null and are noted in
+  `data_quality`; the response notes material differences between Yahoo's
+  yield and the history-derived yield. Financials-sector debt, cash, and
+  margins (especially for banks) are not directly comparable across sectors.
+  Yahoo fundamentals use the same 24-hour info cache.
 - `get_dividends(symbol, years=5)` — return available historical dividend
   payments filtered to 1-50 years (`years` is clamped to that range).
 - `compare_stocks(symbols, period_days=365)` — compare up to 10 unique
@@ -201,6 +216,12 @@ provide the token in the Inspector's authorization settings.
   excess return.
 - `analysis_snapshot(symbol)` — compact stock summary, relative performance,
   fundamentals, recent dividends, key price levels, and data-quality notes.
+- `get_egypt_macro_data()` — return a structured result with the latest FRED
+  observations for Egypt inflation, discount rate, and EGP/USD exchange rate.
+  Requires `FRED_API_KEY`; metric dates, units, age, stale state, and
+  per-series errors are included. If this tool errors or returns stale
+  metrics, the research prompts direct the agent to proceed without affected
+  macro values and disclose that macro context is unavailable or stale.
 
 The `research_company(symbol)` and `build_trade_plan(symbol, horizon,
 risk_tolerance)` MCP prompts guide agents to call the relevant stock tools and

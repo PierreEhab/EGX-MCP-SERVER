@@ -3045,5 +3045,22 @@
     "yahoo_available": true,
     "first_bar_date": "2007-08-13",
     "last_bar_date": "2026-10-22"
+  },
+  {
+    "symbol": "HALN",
+    "yahoo_ticker": "HALN.CA",
+    "name_en": "MNT Tech Holding for Financial Investments (MNT-Halan)",
+    "name_ar": null,
+    "sector": "Financials",
+    "sector_source": "inferred",
+    "aliases": [
+      "MNT-Halan",
+      "MNT Halan",
+      "Halan"
+    ],
+    "variant_of": null,
+    "yahoo_available": null,
+    "first_bar_date": null,
+    "last_bar_date": null
   }
 ]

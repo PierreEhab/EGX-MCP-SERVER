@@ -78,7 +78,6 @@ class StockDataProvider(Protocol):
         """Return the small set of Yahoo-provided company information fields."""
         ...
 
-
 def _minimum_interval() -> float:
     configured = os.getenv("EGX_YAHOO_MIN_INTERVAL_SECONDS", "0.5")
     try:
@@ -237,7 +236,7 @@ class YahooProvider:
         return normalized
 
     def get_info_light(self, entry: dict[str, Any]) -> dict[str, Any]:
-        """Return name, market cap, P/E, 52-week range, and currency if present."""
+        """Return available company info and fundamentals for the 24-hour cache."""
         ticker = entry["yahoo_ticker"]
         info = _yahoo_call(
             entry["symbol"],
@@ -253,9 +252,19 @@ class YahooProvider:
             "name": info.get("longName"),
             "market_cap": _finite_numeric(info.get("marketCap")),
             "trailing_pe": _finite_numeric(info.get("trailingPE")),
+            "forward_pe": _finite_numeric(info.get("forwardPE")),
+            "price_to_book": _finite_numeric(info.get("priceToBook")),
+            "return_on_equity": _finite_numeric(info.get("returnOnEquity")),
+            "profit_margins": _finite_numeric(info.get("profitMargins")),
+            "operating_margins": _finite_numeric(info.get("operatingMargins")),
+            "dividend_yield": _finite_numeric(info.get("dividendYield")),
+            "payout_ratio": _finite_numeric(info.get("payoutRatio")),
+            "total_debt": _finite_numeric(info.get("totalDebt")),
+            "total_cash": _finite_numeric(info.get("totalCash")),
             "week52_high": _finite_numeric(info.get("fiftyTwoWeekHigh")),
             "week52_low": _finite_numeric(info.get("fiftyTwoWeekLow")),
             "currency": info.get("currency"),
+            "financial_currency": info.get("financialCurrency"),
         }
 
 

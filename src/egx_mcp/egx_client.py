@@ -40,6 +40,8 @@ def configure_logging() -> None:
         )
     else:
         logging.getLogger().setLevel(level)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
 
 
 _logger = logging.getLogger(__name__)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import random
@@ -11,7 +12,7 @@ import warnings
 from contextlib import redirect_stdout
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
@@ -71,20 +72,42 @@ def _coverage(ticker: str) -> tuple[bool, str | None, str | None]:
     return False, None, None
 
 
-def main() -> None:
-    """Update catalog coverage fields and print available/missing/stale counts."""
+def main(argv: Sequence[str] | None = None) -> None:
+    """Update catalog coverage fields, optionally for one requested symbol."""
+    parser = argparse.ArgumentParser(
+        description="Verify Yahoo Finance daily-history coverage for EGX symbols."
+    )
+    parser.add_argument(
+        "--only",
+        metavar="SYMBOL",
+        help="verify only this catalog symbol (case-insensitive), for example HALN",
+    )
+    args = parser.parse_args(argv)
+
     logging.basicConfig(stream=sys.stderr, level=logging.INFO)
     warnings.filterwarnings("ignore", module="yfinance")
     entries = json.loads(CATALOG.read_text(encoding="utf-8"))
+    selected = [
+        entry
+        for entry in entries
+        if entry["variant_of"] is None
+        and (
+            args.only is None
+            or entry["symbol"].casefold() == args.only.strip().casefold()
+        )
+    ]
+    if args.only is not None and not selected:
+        parser.error(
+            f"symbol {args.only!r} was not found as a non-variant catalog entry"
+        )
+
     available: list[str] = []
     missing: list[str] = []
     stale: list[str] = []
     last_call = 0.0
     today = datetime.now(ZoneInfo("Africa/Cairo")).date()
 
-    for entry in entries:
-        if entry["variant_of"] is not None:
-            continue
+    for entry in selected:
         wait = MIN_INTERVAL_SECONDS - (time.monotonic() - last_call)
         if last_call and wait > 0:
             time.sleep(wait)
