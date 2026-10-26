@@ -153,6 +153,57 @@ def test_unexpected_source_failure_maps_to_safe_structured_error(
     assert "internal credentials" not in result["error"]["message"]
 
 
+def test_macro_unexpected_failure_logs_location_without_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail() -> dict:
+        raise RuntimeError("SECRET123")
+
+    monkeypatch.setattr(
+        server_module.macro_provider,
+        "get_latest_egypt_macro_data",
+        fail,
+    )
+
+    with caplog.at_level(logging.ERROR, logger=server_module.__name__):
+        result = asyncio.run(server_module.get_egypt_macro_data())
+
+    assert result["error"]["code"] == "DATA_SOURCE_ERROR"
+    assert "SECRET123" not in caplog.text
+    record = next(
+        record
+        for record in caplog.records
+        if "Unexpected failure in get_egypt_macro_data" in record.getMessage()
+    )
+    assert "exception_class=RuntimeError" in record.getMessage()
+    assert "location=test_server.py:" in record.getMessage()
+
+
+def test_stock_unexpected_failure_logs_location_without_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fail(*args, **kwargs):
+        raise RuntimeError("SECRET123")
+
+    monkeypatch.setattr(server_module, "_load_stock", fail)
+
+    with caplog.at_level(logging.ERROR, logger=server_module.__name__):
+        result = asyncio.run(server_module.get_stock_history("COMI"))
+
+    assert result["error"]["code"] == "DATA_SOURCE_ERROR"
+    assert "SECRET123" not in caplog.text
+    record = next(
+        record
+        for record in caplog.records
+        if "Unexpected failure in stock tool get_stock_history"
+        in record.getMessage()
+    )
+    assert "exception_class=RuntimeError" in record.getMessage()
+    assert "location=test_server.py:" in record.getMessage()
+
+
 def test_http_health_is_public_and_mcp_requires_the_configured_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

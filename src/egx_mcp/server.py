@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import threading
+import traceback
 from datetime import date
 from functools import wraps
 from typing import Any, Literal, Sequence
@@ -121,12 +122,30 @@ def _maybe_raise_stock_error(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _log_unexpected_failure(tool_name: str, exc: Exception) -> None:
+    traceback_frames = traceback.extract_tb(exc.__traceback__)
+    if traceback_frames:
+        innermost = traceback_frames[-1]
+        location = (
+            f"{os.path.basename(innermost.filename)}:"
+            f"{innermost.lineno}:{innermost.name}"
+        )
+    else:
+        location = "unknown:0:unknown"
+    _logger.error(
+        "Unexpected failure in %s exception_class=%s location=%s",
+        tool_name,
+        type(exc).__name__,
+        location,
+    )
+
+
 def _unexpected_stock_error(
     tool_name: str,
     symbol: str | list[str] | None,
     exc: Exception,
 ) -> dict[str, Any]:
-    _logger.exception("Unexpected failure in stock tool %s", tool_name)
+    _log_unexpected_failure(f"stock tool {tool_name}", exc)
     payload = _stock_error(
         "DATA_SOURCE_ERROR",
         "An unexpected stock data error occurred.",
@@ -943,33 +962,25 @@ async def analysis_snapshot(symbol: str) -> dict[str, Any]:
 
 
 async def get_egypt_macro_data() -> dict[str, Any]:
-    """Fetch latest free FRED baseline data for Egypt macro-aware planning.
+    """Return Egypt inflation, configured policy rate, and EGP/USD exchange data.
 
-    Requests the latest observation for FPCPITOTLZGEGY (annual consumer price
-    inflation), INTDSRTRM193N (discount rate), and DEXEGUS (EGP per USD).
-    Requires ``FRED_API_KEY``. Values include observation dates and may have
-    different publication frequencies; each metric includes its own error and
-    stale status, so one unavailable series does not hide successful series.
-    Returns a structured dictionary with an ``error`` payload only when all
-    series fail. Null values indicate unavailable data, not a forecast. Use
-    these indicators as context, not as financial advice.
+    Inflation is Egypt's FRED annual calendar-year average CPI measure
+    (FPCPITOTLZGEGY), which lags current monthly inflation and requires
+    ``FRED_API_KEY``. Policy rate comes from ``EGYPT_POLICY_RATE_PCT`` and
+    ``EGYPT_POLICY_RATE_DATE`` (optionally ``EGYPT_POLICY_RATE_NAME``); without
+    these settings it is reported as not configured. Exchange rate is fetched
+    without a key from Exchange Rate API and includes provider attribution.
+    Each metric has its own source, date, age, stale flag, and error. One
+    unavailable metric does not discard the others; a top-level error appears
+    only if all three values are unavailable. This is macro context, not a
+    forecast or financial advice.
     """
     try:
         payload = await asyncio.to_thread(macro_provider.get_latest_egypt_macro_data)
-    except macro_provider.MissingFredApiKeyError as exc:
-        payload = {
-            "source": "FRED",
-            "error": {"code": exc.code, "message": str(exc)},
-        }
-    except macro_provider.MacroDataError as exc:
-        payload = {"source": "FRED", "error": {"code": exc.code, "message": str(exc)}}
     except Exception as exc:
-        _logger.error(
-            "Unexpected failure in get_egypt_macro_data exception_class=%s",
-            type(exc).__name__,
-        )
+        _log_unexpected_failure("get_egypt_macro_data", exc)
         payload = {
-            "source": "FRED",
+            "source": ["FRED", "user_configured", "ExchangeRate-API"],
             "error": {
                 "code": "DATA_SOURCE_ERROR",
                 "message": "An unexpected Egypt macro data error occurred.",
@@ -990,9 +1001,10 @@ def research_company(symbol: str) -> str:
 First call analysis_snapshot and get_stock_fundamentals for {symbol},
 stock_vs_index for {symbol} against EGX30, and get_egypt_macro_data for the
 current macro baseline. Use the returned data and dates; do not infer facts
-that the tools do not provide. If get_egypt_macro_data returns an error, or
-its metrics are stale, continue the analysis without the affected macro
-values and state that macro context is unavailable or stale.
+that the tools do not provide. Distinguish FRED annual calendar-year CPI
+(which lags monthly inflation), the user-configured policy rate, and the
+attributed Exchange Rate API currency quote. If the macro tool returns an
+error, or any metric is stale, continue without affected values and state that macro context is unavailable or stale.
 Then write a structured report with these sections:
 1. Trend: summarize price direction, returns, moving averages, and key levels.
 2. Risk: discuss volatility, drawdown, liquidity caveats, and relative
@@ -1016,8 +1028,9 @@ The user's stated horizon is {horizon}; stated risk tolerance is
 First call analysis_snapshot and get_stock_fundamentals for {symbol};
 get_stock_history for an appropriate period and frequency; stock_vs_index for
 {symbol} against EGX30; and get_egypt_macro_data for macro context. If the
-macro tool returns an error, or its metrics are stale, continue without the
-affected macro values and state that macro context is unavailable or stale.
+macro tool returns an error, or any metric is stale, continue without affected values and state that macro context is unavailable or stale.
+Treat the FRED annual CPI as a lagging calendar-year average, clearly identify
+the policy rate as user-configured, and name Exchange Rate API as the FX source.
 Ground every price level in tool output and cite its as_of date. Then draft:
 1. Bull, base, and bear scenarios, with evidence and conditions that would
    support each scenario.

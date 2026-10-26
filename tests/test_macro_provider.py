@@ -2,34 +2,10 @@ from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import sqlite3
-import threading
 
 import pytest
 
 from egx_mcp import macro_provider
-
-
-class FakeResponse:
-    def __init__(self, series_id: str, value: str, observed_on: str, status: int = 200):
-        self.series_id = series_id
-        self.value = value
-        self.observed_on = observed_on
-        self.status_code = status
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            error = macro_provider.requests.HTTPError(
-                f"Request failed: https://fred.example/?api_key=SECRET123"
-            )
-            error.response = self
-            raise error
-
-    def json(self):
-        return {
-            "observations": [
-                {"date": self.observed_on, "value": self.value}
-            ]
-        }
 
 
 @pytest.fixture
@@ -44,289 +20,415 @@ def macro_cache(monkeypatch, tmp_path):
     return database
 
 
-def _response_for(params):
-    sid = params["series_id"]
-    value = {
-        "FPCPITOTLZGEGY": "12.3",
-        "INTDSRTRM193N": "18.0",
-        "DEXEGUS": "48.0",
-    }[sid]
-    return FakeResponse(sid, value, "2026-10-20")
+class FakeResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
 
 
-def _response_object(observations):
-    class Response:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"observations": observations}
-
-    return Response()
-
-
-def test_macro_requests_run_concurrently_and_return_frequency_aware_freshness(
-    monkeypatch,
-    macro_cache,
-):
-    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
-    barrier = threading.Barrier(3)
-    active = 0
-    active_lock = threading.Lock()
-    max_active = 0
-    observed_params = []
-
-    def get(url, params, timeout):
-        nonlocal active, max_active
-        observed_params.append(params.copy())
-        with active_lock:
-            active += 1
-            max_active = max(max_active, active)
-        barrier.wait(timeout=2)
-        with active_lock:
-            active -= 1
-        return _response_for(params)
-
-    monkeypatch.setattr(macro_provider.requests, "get", get)
-
-    result = macro_provider.get_latest_egypt_macro_data()
-
-    assert max_active == 3
-    assert result["metrics"]["inflation"]["frequency"] == "annual"
-    assert result["metrics"]["discount_rate"]["frequency"] == "monthly"
-    assert result["metrics"]["egp_usd_exchange_rate"]["frequency"] == "daily"
-    assert result["metrics"]["inflation"]["age_days"] == 5
-    assert result["metrics"]["inflation"]["stale"] is False
-    assert result["metrics"]["discount_rate"]["stale"] is False
-    assert result["metrics"]["egp_usd_exchange_rate"]["stale"] is False
-    assert result["data_quality"] == []
-    assert all(metric["error"] is None for metric in result["metrics"].values())
-    assert all(params["limit"] == 10 for params in observed_params)
-
-
-def test_observation_parser_skips_missing_and_non_finite_values(
-    monkeypatch,
-    macro_cache,
-):
-    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
-
-    def get(url, params, timeout):
-        if params["series_id"] == "FPCPITOTLZGEGY":
-            observations = [
-                {"date": "2026-10-21", "value": "."},
-                {"date": "2026-10-20", "value": "12.5"},
-                {"date": "2026-10-19", "value": "11.0"},
+def _fred_response(params):
+    return FakeResponse(
+        {
+            "observations": [
+                {"date": "2025-01-01", "value": "14.07"},
             ]
-        else:
-            observations = [{"date": "2026-10-20", "value": "1"}]
-        return _response_object(observations)
+        }
+    )
+
+
+def _exchange_response(_url, params, timeout):
+    assert params is None
+    assert timeout == 15
+    return FakeResponse(
+        {
+            "result": "success",
+            "time_last_update_utc": "Sat, 24 Oct 2026 00:00:01 +0000",
+            "rates": {"EGP": 47.5},
+        }
+    )
+
+
+def _mock_valid_sources(monkeypatch):
+    def get(url, params=None, timeout=15):
+        if url == macro_provider.FRED_OBSERVATIONS_URL:
+            return _fred_response(params)
+        return _exchange_response(url, params, timeout)
 
     monkeypatch.setattr(macro_provider.requests, "get", get)
 
-    result = macro_provider.get_latest_egypt_macro_data()
-    inflation = result["metrics"]["inflation"]
 
-    assert inflation["value"] == 12.5
-    assert inflation["date"] == "2026-10-20"
-    assert inflation["error"] is None
+def _configure_policy(monkeypatch):
+    monkeypatch.setenv("EGYPT_POLICY_RATE_PCT", "19.25")
+    monkeypatch.setenv("EGYPT_POLICY_RATE_DATE", "2026-10-01")
+    monkeypatch.delenv("EGYPT_POLICY_RATE_NAME", raising=False)
 
 
-def test_all_missing_observations_return_clear_metric_error(monkeypatch, macro_cache):
+def test_macro_returns_correct_sources_metrics_and_stale_rules(
+    monkeypatch,
+    macro_cache,
+):
     monkeypatch.setenv("FRED_API_KEY", "SECRET123")
+    _configure_policy(monkeypatch)
+    _mock_valid_sources(monkeypatch)
+
+    result = macro_provider.get_latest_egypt_macro_data()
+
+    assert set(result["metrics"]) == {
+        "inflation",
+        "policy_rate",
+        "egp_usd_exchange_rate",
+    }
+    inflation = result["metrics"]["inflation"]
+    assert inflation["series_id"] == "FPCPITOTLZGEGY"
+    assert inflation["value"] == 14.07
+    assert inflation["date"] == "2025-01-01"
+    assert inflation["stale"] is False
+    assert "calendar-year average" in inflation["note"].casefold()
+    assert result["metrics"]["policy_rate"]["source"] == "user_configured"
+    assert result["metrics"]["policy_rate"]["value"] == 19.25
+    assert result["metrics"]["policy_rate"]["name"] == (
+        "Central Bank of Egypt policy rate"
+    )
+    exchange = result["metrics"]["egp_usd_exchange_rate"]
+    assert exchange["source"] == "ExchangeRate-API"
+    assert exchange["value"] == 47.5
+    assert exchange["date"] == "2026-10-24"
+    assert "Rates By Exchange Rate API (https://www.exchangerate-api.com)" in exchange[
+        "attribution"
+    ]
+    assert set(result["source"]) == {
+        "FRED",
+        "user_configured",
+        "ExchangeRate-API",
+    }
+
+
+def test_inflation_stale_only_when_observation_year_is_more_than_one_behind(
+    monkeypatch,
+    macro_cache,
+):
+    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
+    _configure_policy(monkeypatch)
+
+    class HistoricalFredResponse(FakeResponse):
+        def json(self):
+            return {
+                "observations": [{"date": "2024-01-01", "value": "14.07"}]
+            }
+
     monkeypatch.setattr(
         macro_provider.requests,
         "get",
-        lambda url, params, timeout: _response_object(
-            [
-                {"date": "2026-10-21", "value": "."},
-                {"date": "2026-10-20", "value": "."},
-            ]
+        lambda url, params=None, timeout=15: (
+            HistoricalFredResponse({})
+            if url == macro_provider.FRED_OBSERVATIONS_URL
+            else _exchange_response(url, params, timeout)
+        ),
+    )
+
+    result = macro_provider.get_latest_egypt_macro_data()
+    assert result["metrics"]["inflation"]["stale"] is True
+
+
+def test_exchange_rate_is_stale_after_three_days(monkeypatch, macro_cache):
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    _configure_policy(monkeypatch)
+
+    def get(url, params=None, timeout=15):
+        if url == macro_provider.FRED_OBSERVATIONS_URL:
+            raise AssertionError("FRED must not be called without a key")
+        return FakeResponse(
+            {
+                "result": "success",
+                "time_last_update_utc": "Wed, 21 Oct 2026 00:00:01 +0000",
+                "rates": {"EGP": 47.5},
+            }
+        )
+
+    monkeypatch.setattr(macro_provider.requests, "get", get)
+
+    result = macro_provider.get_latest_egypt_macro_data()
+
+    assert result["metrics"]["egp_usd_exchange_rate"]["stale"] is True
+
+
+def test_missing_fred_key_only_fails_inflation(monkeypatch, macro_cache):
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    _configure_policy(monkeypatch)
+    monkeypatch.setattr(
+        macro_provider.requests,
+        "get",
+        lambda url, params=None, timeout=15: _exchange_response(
+            url,
+            params,
+            timeout,
         ),
     )
 
     result = macro_provider.get_latest_egypt_macro_data()
 
-    assert result["error"]["code"] == "DATA_SOURCE_ERROR"
-    assert all(metric["value"] is None for metric in result["metrics"].values())
-    assert all(
-        "no valid observation" in metric["error"].casefold()
-        for metric in result["metrics"].values()
-    )
+    error = result["metrics"]["inflation"]["error"]
+    assert error["code"] == "MISSING_API_KEY"
+    assert "FRED_API_KEY" in error["message"]
+    assert result["metrics"]["policy_rate"]["value"] == 19.25
+    assert result["metrics"]["egp_usd_exchange_rate"]["value"] == 47.5
+    assert "error" not in result
 
 
-def test_macro_cache_database_can_be_deleted_after_call(monkeypatch, macro_cache):
-    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
+@pytest.mark.parametrize(
+    ("rate", "observed_on", "expected_code"),
+    [
+        (None, None, "NOT_CONFIGURED"),
+        ("101", "2026-10-01", "INVALID_CONFIGURATION"),
+        ("abc", "2026-10-01", "INVALID_CONFIGURATION"),
+        ("19", "2026-10-26", "INVALID_CONFIGURATION"),
+        ("19", "not-a-date", "INVALID_CONFIGURATION"),
+    ],
+)
+def test_policy_rate_configuration_validation(
+    monkeypatch,
+    macro_cache,
+    rate,
+    observed_on,
+    expected_code,
+):
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    monkeypatch.delenv("EGYPT_POLICY_RATE_PCT", raising=False)
+    monkeypatch.delenv("EGYPT_POLICY_RATE_DATE", raising=False)
+    if rate is not None:
+        monkeypatch.setenv("EGYPT_POLICY_RATE_PCT", rate)
+    if observed_on is not None:
+        monkeypatch.setenv("EGYPT_POLICY_RATE_DATE", observed_on)
     monkeypatch.setattr(
         macro_provider.requests,
         "get",
-        lambda url, params, timeout: _response_for(params),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no call expected")),
     )
 
-    macro_provider.get_latest_egypt_macro_data()
+    result = macro_provider.get_latest_egypt_macro_data()
 
-    macro_cache.unlink()
-    assert not macro_cache.exists()
+    error = result["metrics"]["policy_rate"]["error"]
+    assert error["code"] == expected_code
+    if expected_code == "NOT_CONFIGURED":
+        for variable in (
+            "EGYPT_POLICY_RATE_PCT",
+            "EGYPT_POLICY_RATE_DATE",
+        ):
+            assert variable in error["message"]
 
 
-def test_debug_request_log_does_not_expose_fred_api_key(
+def test_policy_rate_stale_after_sixty_days(monkeypatch, macro_cache):
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    monkeypatch.setenv("EGYPT_POLICY_RATE_PCT", "19")
+    monkeypatch.setenv("EGYPT_POLICY_RATE_DATE", "2026-08-20")
+    monkeypatch.setattr(
+        macro_provider.requests,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no call expected")),
+    )
+
+    result = macro_provider.get_latest_egypt_macro_data()
+    assert result["metrics"]["policy_rate"]["stale"] is True
+
+
+def test_exchange_rate_failure_does_not_log_url_and_has_safe_metric_error(
     monkeypatch,
     macro_cache,
     caplog,
 ):
-    from egx_mcp import egx_client
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    _configure_policy(monkeypatch)
 
-    monkeypatch.setenv("EGX_LOG_LEVEL", "DEBUG")
-    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
+    def fail(url, params=None, timeout=15):
+        if url != macro_provider.FRED_OBSERVATIONS_URL:
+            raise macro_provider.requests.ConnectionError(
+                "https://open.er-api.com/v6/latest/USD?api_key=SECRET123"
+            )
+        raise AssertionError("FRED must not be called without a key")
 
-    def fail_request(url, params, timeout):
-        logging.getLogger("urllib3.connectionpool").debug(
-            "Request params include api_key=%s",
-            params["api_key"],
-        )
-        raise macro_provider.requests.ConnectionError("network unavailable")
+    monkeypatch.setattr(macro_provider.requests, "get", fail)
+    with caplog.at_level(logging.DEBUG):
+        result = macro_provider.get_latest_egypt_macro_data()
 
+    assert "SECRET123" not in caplog.text
+    assert "open.er-api.com" not in caplog.text
+    assert result["metrics"]["egp_usd_exchange_rate"]["error"]["code"] == (
+        "DATA_SOURCE_ERROR"
+    )
+    assert "SECRET123" not in str(result)
+
+
+def test_exchange_rate_requires_success_and_positive_finite_rate(
+    monkeypatch,
+    macro_cache,
+):
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    _configure_policy(monkeypatch)
     monkeypatch.setattr(
         macro_provider.requests,
         "get",
-        fail_request,
+        lambda url, params=None, timeout=15: FakeResponse(
+            {"result": "error", "rates": {"EGP": 47}}
+        ),
     )
 
-    with caplog.at_level(logging.DEBUG):
-        egx_client.configure_logging()
-        macro_provider.get_latest_egypt_macro_data()
-
-    assert "SECRET123" not in caplog.text
-    assert logging.getLogger("urllib3").level == logging.WARNING
-    assert logging.getLogger("requests").level == logging.WARNING
+    result = macro_provider.get_latest_egypt_macro_data()
+    assert result["metrics"]["egp_usd_exchange_rate"]["value"] is None
+    assert result["metrics"]["egp_usd_exchange_rate"]["error"]
 
 
-def test_one_failing_series_preserves_successful_metrics(monkeypatch, macro_cache):
+def test_macro_result_is_cached_for_twelve_hours(monkeypatch, macro_cache):
     monkeypatch.setenv("FRED_API_KEY", "SECRET123")
+    _configure_policy(monkeypatch)
+    calls = []
 
-    def get(url, params, timeout):
-        if params["series_id"] == "INTDSRTRM193N":
-            raise macro_provider.requests.ConnectionError("private endpoint detail")
-        return _response_for(params)
+    def get(url, params=None, timeout=15):
+        calls.append(url)
+        return (
+            _fred_response(params)
+            if url == macro_provider.FRED_OBSERVATIONS_URL
+            else _exchange_response(url, params, timeout)
+        )
+
+    monkeypatch.setattr(macro_provider.requests, "get", get)
+
+    first = macro_provider.get_latest_egypt_macro_data()
+    second = macro_provider.get_latest_egypt_macro_data()
+
+    assert len(calls) == 2
+    assert first["metrics"] == second["metrics"]
+    with sqlite3.connect(macro_cache) as connection:
+        cached_metrics = {
+            row[0]
+            for row in connection.execute(
+                "SELECT metric FROM egypt_macro_cache_v2"
+            )
+        }
+    assert cached_metrics == {"inflation", "egp_usd_exchange_rate"}
+
+
+def test_v2_cache_payload_without_source_is_ignored_and_refetched(
+    monkeypatch,
+    macro_cache,
+):
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    _configure_policy(monkeypatch)
+    with sqlite3.connect(macro_cache) as connection:
+        connection.execute(
+            """
+            CREATE TABLE egypt_macro_cache_v2 (
+                metric TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO egypt_macro_cache_v2 (metric, payload, fetched_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                "egp_usd_exchange_rate",
+                '{"value": 1, "date": "2026-10-24", "name": "old", '
+                '"unit": "EGP per USD", "frequency": "daily"}',
+                datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc).isoformat(),
+            ),
+        )
+    calls = []
+
+    def get(url, params=None, timeout=15):
+        calls.append(url)
+        return _exchange_response(url, params, timeout)
 
     monkeypatch.setattr(macro_provider.requests, "get", get)
 
     result = macro_provider.get_latest_egypt_macro_data()
 
-    assert "error" not in result
-    assert result["metrics"]["inflation"]["value"] == 12.3
-    assert result["metrics"]["egp_usd_exchange_rate"]["value"] == 48.0
-    assert result["metrics"]["discount_rate"]["value"] is None
-    assert result["metrics"]["discount_rate"]["error"]
+    assert calls == [macro_provider.EXCHANGE_RATE_URL]
+    assert result["metrics"]["egp_usd_exchange_rate"]["value"] == 47.5
 
 
-def test_failed_requests_never_log_or_return_api_key(monkeypatch, macro_cache, caplog):
-    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
-
-    def fail_request(*args, **kwargs):
-        error = macro_provider.requests.HTTPError(
-            "https://fred.example/?api_key=SECRET123"
+def test_unknown_fresh_cache_metrics_do_not_add_cache_note(monkeypatch, macro_cache):
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    _configure_policy(monkeypatch)
+    with sqlite3.connect(macro_cache) as connection:
+        connection.execute(
+            """
+            CREATE TABLE egypt_macro_cache_v2 (
+                metric TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL
+            )
+            """
         )
-        error.response = FakeResponse("", "", "", status=429)
-        raise error
-
+        connection.execute(
+            """
+            INSERT INTO egypt_macro_cache_v2 (metric, payload, fetched_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                "discount_rate",
+                '{"value": 1, "date": "2026-10-24", "source": "legacy", '
+                '"name": "legacy", "unit": "percent", "frequency": "daily"}',
+                datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc).isoformat(),
+            ),
+        )
     monkeypatch.setattr(
         macro_provider.requests,
         "get",
-        fail_request,
-    )
-
-    with caplog.at_level(logging.WARNING, logger=macro_provider.__name__):
-        result = macro_provider.get_latest_egypt_macro_data()
-
-    assert "SECRET123" not in caplog.text
-    assert "SECRET123" not in str(result)
-    assert "exception_class=HTTPError http_status=429" in caplog.text
-    assert "HTTP status 429" in result["metrics"]["inflation"]["error"]
-    assert result["error"]["code"] == "DATA_SOURCE_ERROR"
-    assert all(metric["error"] for metric in result["metrics"].values())
-
-
-def test_stale_metrics_are_reported_and_listed_in_data_quality(
-    monkeypatch,
-    macro_cache,
-):
-    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
-    monkeypatch.setattr(
-        macro_provider.requests,
-        "get",
-        lambda url, params, timeout: _response_object(
-            [
-                {
-                    "date": {
-                        "FPCPITOTLZGEGY": "2025-01-01",
-                        "INTDSRTRM193N": "2026-08-20",
-                        "DEXEGUS": "2026-10-20",
-                    }[params["series_id"]],
-                    "value": "1.0",
-                }
-            ]
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            macro_provider.requests.ConnectionError("offline")
         ),
     )
 
     result = macro_provider.get_latest_egypt_macro_data()
 
-    assert result["metrics"]["inflation"]["stale"] is True
-    assert result["metrics"]["discount_rate"]["stale"] is False
-    assert result["metrics"]["egp_usd_exchange_rate"]["stale"] is False
-    assert "inflation" in result["data_quality"]
+    assert "cache_note" not in result
 
 
-def test_all_failed_series_return_individual_errors_and_top_level_error(
+def test_missing_source_on_one_metric_does_not_crash_source_list(
+    monkeypatch,
+    macro_cache,
+):
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    _configure_policy(monkeypatch)
+    monkeypatch.setattr(
+        macro_provider.requests,
+        "get",
+        lambda url, params=None, timeout=15: _exchange_response(
+            url, params, timeout
+        ),
+    )
+    policy_rate = macro_provider._policy_rate
+
+    def missing_source(today):
+        result = policy_rate(today)
+        result.pop("source")
+        return result
+
+    monkeypatch.setattr(macro_provider, "_policy_rate", missing_source)
+
+    result = macro_provider.get_latest_egypt_macro_data()
+
+    assert "user_configured" not in result["source"]
+    assert None not in result["source"]
+
+
+def test_cache_fallback_preserves_sources_and_reports_failed_refresh(
     monkeypatch,
     macro_cache,
 ):
     monkeypatch.setenv("FRED_API_KEY", "SECRET123")
-    monkeypatch.setattr(
-        macro_provider.requests,
-        "get",
-        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError()),
-    )
-
-    result = macro_provider.get_latest_egypt_macro_data()
-
-    assert result["error"]["code"] == "DATA_SOURCE_ERROR"
-    assert len(result["metrics"]) == 3
-    assert all(
-        set(("value", "date", "error")).issubset(metric)
-        for metric in result["metrics"].values()
-    )
-
-
-def test_macro_result_is_cached_for_twelve_hours(monkeypatch, macro_cache):
-    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
-    calls = []
-    monkeypatch.setattr(
-        macro_provider.requests,
-        "get",
-        lambda url, params, timeout: (calls.append(params["series_id"]) or _response_for(params)),
-    )
-
-    first = macro_provider.get_latest_egypt_macro_data()
-    second = macro_provider.get_latest_egypt_macro_data()
-
-    assert len(calls) == 3
-    assert first["metrics"] == second["metrics"]
-    assert "cache" in second["cache_note"].casefold()
-    with sqlite3.connect(macro_cache) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM egypt_macro_cache"
-        ).fetchone()[0] == 3
-
-
-def test_failed_refresh_serves_cached_metrics_with_note(monkeypatch, macro_cache):
-    monkeypatch.setenv("FRED_API_KEY", "SECRET123")
-    monkeypatch.setattr(
-        macro_provider.requests,
-        "get",
-        lambda url, params, timeout: _response_for(params),
-    )
+    _configure_policy(monkeypatch)
+    _mock_valid_sources(monkeypatch)
     cached = macro_provider.get_latest_egypt_macro_data()
 
     monkeypatch.setattr(
@@ -334,22 +436,23 @@ def test_failed_refresh_serves_cached_metrics_with_note(monkeypatch, macro_cache
         "_now",
         lambda: datetime(2026, 10, 26, 1, 0, tzinfo=timezone.utc),
     )
-    monkeypatch.setattr(
-        macro_provider.requests,
-        "get",
-        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError()),
-    )
 
+    def fail(url, params=None, timeout=15):
+        if url == macro_provider.FRED_OBSERVATIONS_URL:
+            raise macro_provider.requests.Timeout("offline")
+        return _exchange_response(url, params, timeout)
+
+    monkeypatch.setattr(macro_provider.requests, "get", fail)
     result = macro_provider.get_latest_egypt_macro_data()
 
     assert result["metrics"]["inflation"]["value"] == cached["metrics"]["inflation"]["value"]
-    assert result["metrics"]["inflation"]["error"]
-    assert "cached" in result["metrics"]["inflation"]["error"].casefold()
-    assert "cached" in result["cache_note"].casefold()
-    assert result["error"]["code"] == "DATA_SOURCE_ERROR"
+    assert "cached" in result["metrics"]["inflation"]["error"]["message"].casefold()
 
 
-def test_cache_database_path_honors_egx_cache_dir(monkeypatch, tmp_path):
-    monkeypatch.setenv("EGX_CACHE_DIR", str(tmp_path))
+def test_no_invalid_series_ids_remain_in_provider_or_tool_source():
+    provider_text = Path(macro_provider.__file__).read_text(encoding="utf-8")
+    from egx_mcp import server
 
-    assert macro_provider.cache_database_path() == tmp_path / "stock_cache.sqlite3"
+    server_text = Path(server.__file__).read_text(encoding="utf-8")
+    invalid_ids = ("INTDSRTRM" + "193N", "DEXE" + "GUS")
+    assert all(identifier not in provider_text + server_text for identifier in invalid_ids)

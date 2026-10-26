@@ -263,7 +263,9 @@ def test_unexpected_stock_errors_are_logged_mapped_and_raised_when_configured(
     result = asyncio.run(get_stock_summary("COMI"))
     assert result["error"]["code"] == "DATA_SOURCE_ERROR"
     assert "private provider failure" not in result["error"]["message"]
-    assert "private provider failure" in caplog.text
+    assert "private provider failure" not in caplog.text
+    assert "exception_class=RuntimeError" in caplog.text
+    assert "location=test_stock_tools.py:" in caplog.text
 
     monkeypatch.setenv("EGX_RAISE_TOOL_ERRORS", "true")
     with pytest.raises(ToolError, match="unexpected stock data error"):
@@ -419,7 +421,7 @@ def test_stock_tools_are_registered_with_fastmcp() -> None:
     }.issubset({tool.name for tool in tools})
 
 
-def test_egypt_macro_tool_requests_all_fred_series(monkeypatch, tmp_path) -> None:
+def test_egypt_macro_tool_returns_separate_macro_sources(monkeypatch, tmp_path) -> None:
     from egx_mcp import macro_provider
 
     monkeypatch.setenv("FRED_API_KEY", "test-api-key")
@@ -431,45 +433,79 @@ def test_egypt_macro_tool_requests_all_fred_series(monkeypatch, tmp_path) -> Non
     calls: list[dict] = []
 
     class Response:
-        def __init__(self, series_id):
-            self.series_id = series_id
+        def __init__(self, payload):
+            self.payload = payload
 
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {
-                "observations": [{"date": "2026-09-01", "value": "12.3"}]
-            }
+            return self.payload
 
-    def fake_get(url, params, timeout):
+    def fake_get(url, params=None, timeout=15):
         calls.append({"url": url, "params": params, "timeout": timeout})
-        return Response(params["series_id"])
+        if url == macro_provider.FRED_OBSERVATIONS_URL:
+            return Response(
+                {"observations": [{"date": "2025-01-01", "value": "14.07"}]}
+            )
+        return Response(
+            {
+                "result": "success",
+                "time_last_update_utc": "Sat, 24 Oct 2026 00:00:01 +0000",
+                "rates": {"EGP": 47.5},
+            }
+        )
 
     monkeypatch.setattr(macro_provider.requests, "get", fake_get)
     payload = asyncio.run(get_egypt_macro_data())
 
-    assert len(calls) == 3
-    assert {call["params"]["series_id"] for call in calls} == {
-        "FPCPITOTLZGEGY",
-        "INTDSRTRM193N",
-        "DEXEGUS",
-    }
-    assert all(call["params"]["api_key"] == "test-api-key" for call in calls)
-    assert all(call["params"]["limit"] == 10 for call in calls)
-    assert all(call["params"]["sort_order"] == "desc" for call in calls)
-    assert payload["source"] == "FRED"
+    assert len(calls) == 2
+    fred_call = next(
+        call for call in calls if call["url"] == macro_provider.FRED_OBSERVATIONS_URL
+    )
+    assert fred_call["params"]["series_id"] == "FPCPITOTLZGEGY"
+    assert fred_call["params"]["api_key"] == "test-api-key"
+    assert fred_call["params"]["limit"] == 10
+    assert fred_call["params"]["sort_order"] == "desc"
+    assert set(payload["source"]) == {"FRED", "user_configured", "ExchangeRate-API"}
     assert isinstance(payload, dict)
-    assert payload["metrics"]["inflation"]["value"] == 12.3
+    assert payload["metrics"]["inflation"]["value"] == 14.07
+    assert payload["metrics"]["policy_rate"]["error"]["code"] == "NOT_CONFIGURED"
+    assert payload["metrics"]["egp_usd_exchange_rate"]["value"] == 47.5
 
 
-def test_egypt_macro_tool_returns_clear_missing_key_error(monkeypatch) -> None:
+def test_egypt_macro_tool_missing_key_only_marks_inflation(monkeypatch, tmp_path) -> None:
+    from egx_mcp import macro_provider
+
     monkeypatch.delenv("FRED_API_KEY", raising=False)
+    monkeypatch.setattr(
+        macro_provider,
+        "cache_database_path",
+        lambda: tmp_path / "stock_cache.sqlite3",
+    )
+    monkeypatch.setattr(
+        macro_provider.requests,
+        "get",
+        lambda *args, **kwargs: type(
+            "Response",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {
+                    "result": "success",
+                    "time_last_update_utc": "Sat, 24 Oct 2026 00:00:01 +0000",
+                    "rates": {"EGP": 47.5},
+                },
+            },
+        )(),
+    )
 
     payload = asyncio.run(get_egypt_macro_data())
 
-    assert payload["error"]["code"] == "MISSING_API_KEY"
-    assert "FRED_API_KEY" in payload["error"]["message"]
+    assert payload["metrics"]["inflation"]["error"]["code"] == "MISSING_API_KEY"
+    assert "FRED_API_KEY" in payload["metrics"]["inflation"]["error"]["message"]
+    assert payload["metrics"]["egp_usd_exchange_rate"]["value"] == 47.5
+    assert "error" not in payload
 
 
 def test_egypt_macro_tool_maps_source_errors_and_raise_mode(
@@ -497,7 +533,7 @@ def test_egypt_macro_tool_maps_source_errors_and_raise_mode(
     assert "private response" not in caplog.text
 
     monkeypatch.setenv("EGX_RAISE_TOOL_ERRORS", "true")
-    with pytest.raises(ToolError, match="All three FRED series requests failed"):
+    with pytest.raises(ToolError, match="No usable values are available"):
         asyncio.run(get_egypt_macro_data())
 
 
@@ -523,6 +559,9 @@ def test_research_prompts_include_workflow_and_required_caveats() -> None:
         "risk",
         "valuation caveats",
         "state that macro context is unavailable or stale",
+        "user-configured policy rate",
+        "calendar-year CPI",
+        "Exchange Rate API",
     ):
         assert phrase.casefold() in company_prompt.casefold()
     for phrase in (
@@ -536,6 +575,8 @@ def test_research_prompts_include_workflow_and_required_caveats() -> None:
         "daily price limits",
         "thin liquidity",
         "state that macro context is unavailable or stale",
+        "user-configured",
+        "Exchange Rate API",
         "stale or missing data",
     ):
         assert phrase.casefold() in trade_prompt.casefold()

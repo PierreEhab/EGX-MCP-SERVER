@@ -76,7 +76,10 @@ any port for that host.
 | `EGX_CACHE_TTL_SECONDS` | `300` | Source-data cache TTL in seconds; `0` disables caching. |
 | `EGX_CACHE_DIR` | `%LOCALAPPDATA%\egx-mcp` on Windows when available; `~/.cache/egx-mcp` otherwise | Directory for the persistent SQLite stock cache. |
 | `EGX_YAHOO_MIN_INTERVAL_SECONDS` | `0.5` | Minimum delay between Yahoo calls; rate-limit responses are retried with backoff. |
-| `FRED_API_KEY` | Unset | Required for the free FRED macroeconomic data tool; obtain a key from FRED and set it in the server process environment. |
+| `FRED_API_KEY` | Unset | Optional; required only for Egypt annual CPI inflation from FRED. Set it in the server process environment. |
+| `EGYPT_POLICY_RATE_PCT` | Unset | User-configured Central Bank of Egypt policy rate, numeric percent from 0 to 100. |
+| `EGYPT_POLICY_RATE_DATE` | Unset | ISO date for the policy-rate observation; future dates are rejected and values older than 60 days are stale. |
+| `EGYPT_POLICY_RATE_NAME` | `Central Bank of Egypt policy rate` | Optional display name for the configured policy-rate metric. |
 | `EGX_LOG_LEVEL` | `INFO` | Python logging level; source errors are logged to stderr so stdio MCP stays clean. |
 | `EGX_RAISE_TOOL_ERRORS` | `false` | With `true`, raise the MCP SDK `ToolError` so MCP clients receive `isError`; otherwise return the existing structured error payload. |
 | `MCP_TRANSPORT` | `stdio` | Default transport: `stdio`, `http`, or `streamable-http`. |
@@ -109,7 +112,10 @@ Add this to Claude Desktop's `claude_desktop_config.json`:
         "egx-mcp-server"
       ],
       "env": {
-        "FRED_API_KEY": "your-fred-api-key"
+        "FRED_API_KEY": "your-fred-api-key",
+        "EGYPT_POLICY_RATE_PCT": "your-current-policy-rate-percent",
+        "EGYPT_POLICY_RATE_DATE": "YYYY-MM-DD",
+        "EGYPT_POLICY_RATE_NAME": "Central Bank of Egypt policy rate"
       }
     }
   }
@@ -117,9 +123,10 @@ Add this to Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Claude Desktop does not load the project's `.env` file automatically. Set
-`FRED_API_KEY` in the MCP server's `env` block as shown above (or provide it in
-the process environment before starting Claude Desktop); do not add the key to
-the repository's `.env` file expecting it to be loaded.
+Set `FRED_API_KEY` in the MCP server's `env` block to enable FRED annual
+inflation; the policy-rate variables are optional but must be configured
+together for that metric. Claude Desktop does not load the project's `.env`
+file automatically, so do not rely on `.env` for these settings.
 
 ### Claude Code
 
@@ -217,11 +224,14 @@ provide the token in the Inspector's authorization settings.
 - `analysis_snapshot(symbol)` — compact stock summary, relative performance,
   fundamentals, recent dividends, key price levels, and data-quality notes.
 - `get_egypt_macro_data()` — return a structured result with the latest FRED
-  observations for Egypt inflation, discount rate, and EGP/USD exchange rate.
-  Requires `FRED_API_KEY`; metric dates, units, age, stale state, and
-  per-series errors are included. If this tool errors or returns stale
-  metrics, the research prompts direct the agent to proceed without affected
-  macro values and disclose that macro context is unavailable or stale.
+  annual CPI inflation, a user-configured policy rate, and the EGP/USD
+  exchange rate from Exchange Rate API. `FRED_API_KEY` is required only for
+  inflation; configure the policy rate with `EGYPT_POLICY_RATE_PCT` and
+  `EGYPT_POLICY_RATE_DATE`. Metric sources, dates, units, age, stale state,
+  and per-metric errors are included. Inflation is a calendar-year average
+  that lags monthly inflation. FX attribution: Rates By Exchange Rate API
+  (https://www.exchangerate-api.com). If macro values are unavailable or
+  stale, the research prompts direct the agent to disclose that limitation.
 
 The `research_company(symbol)` and `build_trade_plan(symbol, horizon,
 risk_tolerance)` MCP prompts guide agents to call the relevant stock tools and
